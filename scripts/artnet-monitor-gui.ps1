@@ -631,7 +631,13 @@ function Build-HealthGrid {
 function Refresh-HealthGrid {
     if (-not (Test-Path $StatusJsonPath)) { return }
     $status = $null
-    try { $status = Get-Content $StatusJsonPath -Raw | ConvertFrom-Json } catch { return }
+    try {
+        $fs     = [System.IO.File]::Open($StatusJsonPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+        $raw    = $reader.ReadToEnd()
+        $reader.Close(); $fs.Dispose()
+        $status = $raw | ConvertFrom-Json
+    } catch { return }
     if (-not $status -or -not $status.universes) { return }
     foreach ($kv in $script:healthTiles.GetEnumerator()) {
         $uni  = $kv.Key
@@ -660,11 +666,6 @@ function Refresh-HealthGrid {
         }
         $lbl.Text = "U$uni`n$stateShort`n${hz} Hz"
     }
-}
-
-function Update-Status {
-    } catch {}
-    Refresh-Log
 }
 
 function Update-Status {
