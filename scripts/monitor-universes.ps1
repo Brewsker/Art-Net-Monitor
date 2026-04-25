@@ -52,6 +52,8 @@ $rateWarnHz       = 44   # Art-Net spec max pkt/s per universe (node buffer faul
 $detectSACN       = $true  # warn if sACN appears for a monitored universe (eNode auto-switches)
 $detectARPConflict = $true  # warn on ARP IP-MAC changes (node IP conflict = network blackout)
 $warnArtCommand   = $true  # warn on ArtAddress/ArtInput packets that reconfigure node ports
+$suppressStart    = ""    # "HH:mm" suppress alert emails from this time (24h); "" = disabled
+$suppressEnd      = ""    # "HH:mm" suppress alert emails until this time (24h); "" = disabled
 $logMaxSizeMB     = 5      # max alerts.log size in MB before rotation
 $logKeepCount     = 3      # number of rotated log files to keep
 $capturesDir      = "C:\AV-Monitoring\captures"  # directory for .pcap alert captures
@@ -83,12 +85,17 @@ if (Test-Path $ConfigPath) {
         if ($cfg.logging.keep_count)                         { $logKeepCount     = [int]$cfg.logging.keep_count }
         if ($null -ne $cfg.logging.capture_on_alert)         { $captureOnAlert   = [bool]$cfg.logging.capture_on_alert }
         if ($cfg.logging.capture_duration_seconds)           { $captureDurationSecs = [int]$cfg.logging.capture_duration_seconds }
+        if ($cfg.monitoring.suppress_start) { $suppressStart = $cfg.monitoring.suppress_start }
+        if ($cfg.monitoring.suppress_end)   { $suppressEnd   = $cfg.monitoring.suppress_end }
     } catch {
         Write-Warning "Could not fully load $ConfigPath : $_  -- Using defaults."
     }
 } else {
     Write-Warning "config.json not found at $ConfigPath. Using defaults."
 }
+
+# Path for GUI health-grid status file (derived after config sets $logsDir)
+$statusJsonPath = Join-Path $logsDir "universe-status.json"
 
 # ---------------------------------------------------------------------------
 # Email configuration (from config.json [email] section)
@@ -191,7 +198,25 @@ function Write-Alert {
     }
     Write-Host $entry -ForegroundColor $color
     Add-Content -Path $alertsLog -Value $entry
-    Send-AlertEmail -Type $Type -Message $Message
+    # Check alert suppression window — still write to log, but skip email when suppressed
+    $script:emailSuppressed = $false
+    if ($suppressStart -and $suppressEnd) {
+        $nowT    = [DateTime]::Now
+        $nowMins = $nowT.Hour * 60 + $nowT.Minute
+        $sParts  = $suppressStart -split ':'
+        $eParts  = $suppressEnd   -split ':'
+        if ($sParts.Count -eq 2 -and $eParts.Count -eq 2) {
+            $sMins = [int]$sParts[0] * 60 + [int]$sParts[1]
+            $eMins = [int]$eParts[0] * 60 + [int]$eParts[1]
+            if ($sMins -le $eMins) {
+                $script:emailSuppressed = ($nowMins -ge $sMins -and $nowMins -lt $eMins)
+            } else {
+                # Window spans midnight
+                $script:emailSuppressed = ($nowMins -ge $sMins -or $nowMins -lt $eMins)
+            }
+        }
+    }
+    if (-not $script:emailSuppressed) { Send-AlertEmail -Type $Type -Message $Message }
     if ($Type -eq 'ALERT')    { $script:sessionAlertCount++; Start-AlertCapture -AlertMessage $Message }
     if ($Type -eq 'RECOVERY') { $script:sessionRecoveryCount++ }
 }
@@ -462,7 +487,35 @@ function Write-StatusSummary {
 }
 
 # ---------------------------------------------------------------------------
-# Start tshark process (non-interactive, stdout redirected)
+# Universe status JSON (read by the GUI health-grid every ~2 s)
+# Written atomically via temp-file + rename to avoid partial JSON reads.
+# ---------------------------------------------------------------------------
+function Write-UniverseStatus {
+    $now     = [DateTime]::Now
+    $uniData = [ordered]@{}
+    foreach ($uni in ($universeTable.Keys | Sort-Object)) {
+        $e     = $universeTable[$uni]
+        $age   = if ($e.EverSeen) { [math]::Round(($now - $e.LastSeen).TotalSeconds, 1) } else { 9999 }
+        $hz    = if ($uniRateQ.ContainsKey($uni)) { $uniRateQ[$uni].Count } else { 0 }
+        $state = if (-not $e.EverSeen)   { 'NEVER_SEEN' }
+                 elseif ($e.Alerted)     { 'DROPPED' }
+                 elseif ($e.RateAlerted) { 'OVERLOAD' }
+                 else                    { 'OK' }
+        $uniData["$uni"] = [ordered]@{
+            state         = $state
+            last_seen_age = $age
+            hz            = $hz
+            sources       = $e.Sources.Count
+            ever_seen     = $e.EverSeen
+        }
+    }
+    $payload = [ordered]@{ updated = $now.ToString('yyyy-MM-ddTHH:mm:ss'); universes = $uniData }
+    try {
+        $tmp = "$statusJsonPath.tmp"
+        $payload | ConvertTo-Json -Depth 4 | Set-Content $tmp -Encoding UTF8 -Force
+        Move-Item -Path $tmp -Destination $statusJsonPath -Force
+    } catch {}
+} (non-interactive, stdout redirected)
 # ---------------------------------------------------------------------------
 # Capture Art-Net (6454), sACN (5568), and ARP - the three protocol classes that
 # can directly cause an eNode to fault a DMX port.
@@ -666,6 +719,7 @@ try {
 
         # Always check timeouts (even when no packets arrive)
         Invoke-TimeoutCheck
+        Write-UniverseStatus
 
         # Periodic status summary
         if (([DateTime]::Now - $lastStatusTime).TotalSeconds -ge $statusInterval) {
@@ -683,6 +737,7 @@ try {
 
     $exitCode = if ($null -ne $proc -and $proc.HasExited) { $proc.ExitCode } else { "N/A" }
     Write-StatusSummary
+    Write-UniverseStatus
     Write-Alert "INFO" "Monitor stopped. Packets:$packetCount  tshark exit:$exitCode"
     Send-SessionSummaryEmail
     Write-Host "Monitor stopped." -ForegroundColor Gray
