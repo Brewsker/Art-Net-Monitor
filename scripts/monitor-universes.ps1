@@ -52,6 +52,11 @@ $rateWarnHz       = 44   # Art-Net spec max pkt/s per universe (node buffer faul
 $detectSACN       = $true  # warn if sACN appears for a monitored universe (eNode auto-switches)
 $detectARPConflict = $true  # warn on ARP IP-MAC changes (node IP conflict = network blackout)
 $warnArtCommand   = $true  # warn on ArtAddress/ArtInput packets that reconfigure node ports
+$logMaxSizeMB     = 5      # max alerts.log size in MB before rotation
+$logKeepCount     = 3      # number of rotated log files to keep
+$capturesDir      = "C:\AV-Monitoring\captures"  # directory for .pcap alert captures
+$captureOnAlert   = $false # trigger a background tshark .pcap capture on each ALERT
+$captureDurationSecs = 5   # duration of each triggered .pcap capture in seconds
 
 # ---------------------------------------------------------------------------
 # Load config.json (single pass - monitoring + email settings)
@@ -62,6 +67,7 @@ if (Test-Path $ConfigPath) {
         if ($cfg.paths.tshark)                               { $tsharkPath       = $cfg.paths.tshark }
         if ($cfg.paths.alerts_log)                           { $alertsLog        = $cfg.paths.alerts_log }
         if ($cfg.paths.logs)                                 { $logsDir          = $cfg.paths.logs }
+        if ($cfg.paths.captures)                             { $capturesDir      = $cfg.paths.captures }
         if ($cfg.capture.interface_id)                       { $captureInterface = [int]$cfg.capture.interface_id }
         if ($cfg.capture.filter)                             { $captureFilter    = $cfg.capture.filter }
         if ($cfg.monitoring.timeout_seconds)                 { $timeoutSecs      = [int]$cfg.monitoring.timeout_seconds }
@@ -73,6 +79,10 @@ if (Test-Path $ConfigPath) {
         if ($null -ne $cfg.monitoring.detect_sacn)           { $detectSACN       = [bool]$cfg.monitoring.detect_sacn }
         if ($null -ne $cfg.monitoring.detect_arp_conflict)   { $detectARPConflict = [bool]$cfg.monitoring.detect_arp_conflict }
         if ($null -ne $cfg.monitoring.warn_art_command)      { $warnArtCommand   = [bool]$cfg.monitoring.warn_art_command }
+        if ($cfg.logging.max_size_mb)                        { $logMaxSizeMB     = [int]$cfg.logging.max_size_mb }
+        if ($cfg.logging.keep_count)                         { $logKeepCount     = [int]$cfg.logging.keep_count }
+        if ($null -ne $cfg.logging.capture_on_alert)         { $captureOnAlert   = [bool]$cfg.logging.capture_on_alert }
+        if ($cfg.logging.capture_duration_seconds)           { $captureDurationSecs = [int]$cfg.logging.capture_duration_seconds }
     } catch {
         Write-Warning "Could not fully load $ConfigPath : $_  -- Using defaults."
     }
@@ -182,6 +192,126 @@ function Write-Alert {
     Write-Host $entry -ForegroundColor $color
     Add-Content -Path $alertsLog -Value $entry
     Send-AlertEmail -Type $Type -Message $Message
+    if ($Type -eq 'ALERT')    { $script:sessionAlertCount++; Start-AlertCapture -AlertMessage $Message }
+    if ($Type -eq 'RECOVERY') { $script:sessionRecoveryCount++ }
+}
+
+# ---------------------------------------------------------------------------
+# Triggered .pcap capture on ALERT (background process, non-blocking)
+# Filename: alert_U{universe}_{timestamp}.pcap saved to captures dir
+# ---------------------------------------------------------------------------
+function Start-AlertCapture {
+    param([string]$AlertMessage)
+    if (-not $captureOnAlert) { return }
+    if (-not (Test-Path $capturesDir)) {
+        try { New-Item -ItemType Directory -Path $capturesDir -Force | Out-Null } catch { return }
+    }
+    # Extract universe number from alert message text if present
+    $uniTag = ''
+    if ($AlertMessage -match 'Universe (\d+)') { $uniTag = "_U$($Matches[1])" }
+    $ts2      = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $pcapFile = Join-Path $capturesDir "alert${uniTag}_${ts2}.pcap"
+    try {
+        $capPsi                        = New-Object System.Diagnostics.ProcessStartInfo
+        $capPsi.FileName               = $tsharkPath
+        $capPsi.Arguments              = "-i $captureInterface -f `"udp port 6454`" -a duration:$captureDurationSecs -w `"$pcapFile`""
+        $capPsi.RedirectStandardOutput = $false
+        $capPsi.RedirectStandardError  = $false
+        $capPsi.UseShellExecute        = $false
+        $capPsi.CreateNoWindow         = $true
+        [void][System.Diagnostics.Process]::Start($capPsi)
+        $logTs = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[INFO] [$logTs] .pcap capture started: $pcapFile (${captureDurationSecs}s)"
+    } catch {
+        $capErr = $_.Exception.Message
+        $logTs  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] .pcap capture failed to start: $capErr"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Session summary email (sent once on clean exit via finally)
+# ---------------------------------------------------------------------------
+function Send-SessionSummaryEmail {
+    if (-not $emailEnabled)                    { return }
+    if (-not $emailFrom -or -not $emailTo)     { return }
+    $sendPass = ''
+    try {
+        $sendCfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        if ($sendCfg.email.app_password) { $sendPass = $sendCfg.email.app_password }
+    } catch {}
+    if (-not $sendPass -or $sendPass -match '^xxxx') { return }
+    $now       = [DateTime]::Now
+    $uptime    = [int]($now - $monitorStart).TotalSeconds
+    $uptimeStr = '{0:D2}h {1:D2}m {2:D2}s' -f [int]($uptime / 3600), [int](($uptime % 3600) / 60), ($uptime % 60)
+    $neverSeen = @($expectedUnis | Where-Object {
+        -not $universeTable.ContainsKey([int]$_) -or -not $universeTable[[int]$_].EverSeen
+    })
+    $rateOverloads = @($universeTable.Keys | Where-Object { $universeTable[$_].RateAlerted })
+    $sacnConflicts = @($sacnWarnTimes.Keys)
+    $lines = @(
+        '=== Art-Net Monitor Session Summary ===',
+        "Host      : $(hostname)",
+        "Uptime    : $uptimeStr",
+        "Packets   : $packetCount",
+        '',
+        "Alerts    : $($script:sessionAlertCount)",
+        "Recoveries: $($script:sessionRecoveryCount)",
+        ''
+    )
+    if ($neverSeen.Count -gt 0) {
+        $lines += "Universes never seen : $($neverSeen -join ', ')"
+    } else {
+        $lines += 'All expected universes were seen.'
+    }
+    if ($rateOverloads.Count -gt 0) { $lines += "Rate overload (U)    : $($rateOverloads -join ', ')" }
+    if ($sacnConflicts.Count  -gt 0) { $lines += "sACN conflicts (U)   : $($sacnConflicts  -join ', ')" }
+    try {
+        $subject = "[Art-Net Monitor] Session Summary - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+        $body    = $lines -join "`r`n"
+        $smtp3   = New-Object System.Net.Mail.SmtpClient($smtpServer, $smtpPort)
+        $smtp3.EnableSsl             = $smtpUseSSL
+        $smtp3.DeliveryMethod        = [System.Net.Mail.SmtpDeliveryMethod]::Network
+        $smtp3.UseDefaultCredentials = $false
+        $smtp3.Credentials           = New-Object System.Net.NetworkCredential($emailFrom, $sendPass)
+        $msg3         = New-Object System.Net.Mail.MailMessage
+        $msg3.From    = $emailFrom
+        $msg3.To.Add($emailTo)
+        $msg3.Subject = $subject
+        $msg3.Body    = $body
+        $smtp3.Send($msg3)
+        $msg3.Dispose()
+        $smtp3.Dispose()
+        $logTs = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[INFO] [$logTs] Session summary email sent -> $emailTo"
+    } catch {
+        $sumErr = $_.Exception.Message
+        $logTs  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] Session summary email failed: $sumErr"
+    } finally {
+        $sendPass = $null
+        Remove-Variable sendPass -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Log rotation: called once at startup before first write
+# ---------------------------------------------------------------------------
+function Rotate-AlertsLog {
+    if (-not (Test-Path $alertsLog)) { return }
+    $sizeBytes = (Get-Item $alertsLog).Length
+    if ($sizeBytes -lt ($logMaxSizeMB * 1MB)) { return }
+    $logDir  = Split-Path $alertsLog -Parent
+    $logLeaf = Split-Path $alertsLog -Leaf
+    # Shift existing rotated files up; delete oldest when it exceeds keep_count
+    for ($i = ($logKeepCount - 1); $i -ge 1; $i--) {
+        $src = Join-Path $logDir "$logLeaf.$i"
+        $dst = Join-Path $logDir "$logLeaf.$($i + 1)"
+        if (Test-Path $dst) { Remove-Item $dst -Force }
+        if (Test-Path $src) { Rename-Item -Path $src -NewName "$logLeaf.$($i + 1)" -Force }
+    }
+    Rename-Item -Path $alertsLog -NewName "$logLeaf.1" -Force
+    Write-Host "[INFO] alerts.log rotated ($([math]::Round($sizeBytes / 1MB, 1)) MB exceeded ${logMaxSizeMB}MB threshold)" -ForegroundColor DarkCyan
 }
 
 # ---------------------------------------------------------------------------
@@ -210,6 +340,8 @@ $universeTable  = @{}
 $monitorStart   = [DateTime]::Now
 $lastStatusTime = [DateTime]::Now
 $packetCount    = 0
+$script:sessionAlertCount    = 0
+$script:sessionRecoveryCount = 0
 
 function Initialize-Universe([int]$uni) {
     if (-not $universeTable.ContainsKey($uni)) {
@@ -360,10 +492,11 @@ Write-Host "Expected unis : $($expectedUnis -join ', ')" -ForegroundColor Gray
 Write-Host "Grace period  : ${startupGrace}s" -ForegroundColor Gray
 Write-Host "Alerts log    : $alertsLog" -ForegroundColor Gray
 Write-Host "Fault detection: rate>${rateWarnHz}Hz | sACN=$(if($detectSACN){'on'}else{'off'}) | ARP=$(if($detectARPConflict){'on'}else{'off'}) | ArtCmd=$(if($warnArtCommand){'on'}else{'off'})" -ForegroundColor DarkGray
+Write-Host "Log rotation    : max=${logMaxSizeMB}MB keep=${logKeepCount} | Alert capture: $(if($captureOnAlert){'on ('+$captureDurationSecs+'s)'}else{'off'})" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Events will appear below. Press Ctrl+C to stop." -ForegroundColor Yellow
 Write-Host ""
-
+Rotate-AlertsLog
 Write-Alert "INFO" "Monitor started - interface:$captureInterface  universes:$($expectedUnis -join ',')  timeout:${timeoutSecs}s"
 
 # ---------------------------------------------------------------------------
@@ -551,6 +684,7 @@ try {
     $exitCode = if ($null -ne $proc -and $proc.HasExited) { $proc.ExitCode } else { "N/A" }
     Write-StatusSummary
     Write-Alert "INFO" "Monitor stopped. Packets:$packetCount  tshark exit:$exitCode"
+    Send-SessionSummaryEmail
     Write-Host "Monitor stopped." -ForegroundColor Gray
     Write-Host ""
     Read-Host "Press Enter to close"
