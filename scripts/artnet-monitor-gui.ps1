@@ -62,11 +62,14 @@ function Save-Config {
         [string]$GenDestIP, [string]$GenSrcIP,
         [int]$GenCount, [int]$GenStart, [int]$GenPPS, [int[]]$GenEnabled
     )
-    # Preserve existing email/generator/alerts values if not supplied
+    # Preserve existing values for sections that the GUI doesn't fully manage
     Load-Config
-    $existingEmail  = if ($script:cfg -and $script:cfg.email)   { $script:cfg.email }   else { $null }
-    $existingGen    = if ($script:cfg -and $script:cfg.generator){ $script:cfg.generator } else { $null }
-    $existingAlerts = if ($script:cfg -and $script:cfg.alerts)  { $script:cfg.alerts }  else { $null }
+    $existingEmail   = if ($script:cfg -and $script:cfg.email)     { $script:cfg.email }     else { $null }
+    $existingGen     = if ($script:cfg -and $script:cfg.generator)  { $script:cfg.generator }  else { $null }
+    $existingAlerts  = if ($script:cfg -and $script:cfg.alerts)    { $script:cfg.alerts }    else { $null }
+    $existingLogging = if ($script:cfg -and $script:cfg.logging)   { $script:cfg.logging }   else { $null }
+    $existingWatch   = if ($script:cfg -and $script:cfg.watchdog)  { $script:cfg.watchdog }  else { $null }
+    $existingCap     = if ($script:cfg -and $script:cfg.capture)   { $script:cfg.capture }   else { $null }
 
     $emailObj = [ordered]@{
         enabled      = $EmailEnabled
@@ -93,8 +96,17 @@ function Save-Config {
         packets_per_second = if ($GenPPS -gt 0) { $GenPPS } elseif ($existingGen) { [int]$existingGen.packets_per_second } else { 10 }
         enabled_universes = if ($GenEnabled) { $GenEnabled } else { @() }
     }
+    # Preserve logging/watchdog/interface_ids that the GUI doesn't edit
+    $loggingObj  = if ($existingLogging) { $existingLogging } else {
+        [ordered]@{ max_size_mb = 5; keep_count = 3; capture_on_alert = $false; capture_duration_seconds = 5 }
+    }
+    $watchdogObj = if ($existingWatch) { $existingWatch } else {
+        [ordered]@{ restart_delay_seconds = 10; max_restarts = 0 }
+    }
+    $ifaceIds    = if ($existingCap -and $existingCap.interface_ids) { $existingCap.interface_ids } else { @() }
+
     $obj = [ordered]@{
-        capture    = [ordered]@{ interface_id = $InterfaceId; filter = 'udp port 6454' }
+        capture    = [ordered]@{ interface_id = $InterfaceId; interface_ids = $ifaceIds; filter = 'udp port 6454' }
         monitoring = [ordered]@{
             expected_universes    = $Universes
             timeout_seconds       = $Timeout
@@ -107,6 +119,8 @@ function Save-Config {
         email     = $emailObj
         generator = $genObj
         alerts    = $alertsObj
+        logging   = $loggingObj
+        watchdog  = $watchdogObj
         paths = [ordered]@{
             tshark     = $TsharkPath
             captures   = 'C:\AV-Monitoring\captures'

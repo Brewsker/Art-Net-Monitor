@@ -8,20 +8,29 @@
 #   .\artnet-generator.ps1 -UniverseCount 24 -StartUniverse 1
 #   .\artnet-generator.ps1 -EnabledUniverses 1,2,5 -UniverseCount 8
 #   .\artnet-generator.ps1 -SourceIP 192.168.50.1 -DestinationIP 255.255.255.255 -DurationSeconds 0
+#   .\artnet-generator.ps1 -Burst -BurstHz 100 -BurstDurationSeconds 30
+#   .\artnet-generator.ps1 -SceneFile C:\scenes\show.json -AutoStep
 #
 # Art-Net spec: https://art-net.org.uk/structure/streaming-packets/artdmx-packet-definition/
 
 param(
-    [int[]]$Universes        = @(),
-    [int]$UniverseCount      = 0,
-    [int]$StartUniverse      = 1,
-    [int[]]$EnabledUniverses = @(),
-    [string]$DestinationIP   = "255.255.255.255",
-    [string]$SourceIP        = "",
-    [int]$PacketsPerSecond   = 10,
-    [int]$DurationSeconds    = 60,
+    [int[]]$Universes            = @(),
+    [int]$UniverseCount          = 0,
+    [int]$StartUniverse          = 1,
+    [int[]]$EnabledUniverses     = @(),
+    [string]$DestinationIP       = "255.255.255.255",
+    [string]$SourceIP            = "",
+    [int]$PacketsPerSecond       = 10,
+    [int]$DurationSeconds        = 60,
     [switch]$Ramp,
-    [string]$ConfigPath      = "C:\AV-Monitoring\config.json"
+    # F3: Burst / stress test mode
+    [switch]$Burst,
+    [int]$BurstHz                = 100,
+    [int]$BurstDurationSeconds   = 30,
+    # F2: Scene stepping
+    [string]$SceneFile           = "",
+    [switch]$AutoStep,
+    [string]$ConfigPath          = "C:\AV-Monitoring\config.json"
 )
 
 if (Test-Path $ConfigPath) {
@@ -37,6 +46,14 @@ if (Test-Path $ConfigPath) {
         }
     } catch {}
 }
+
+# F1: Per-channel overrides from config (array of { universe, channel, value })
+$channelOverrides = @()
+try {
+    if ($cfg -and $cfg.generator -and $cfg.generator.channel_overrides) {
+        $channelOverrides = @($cfg.generator.channel_overrides)
+    }
+} catch {}
 
 if ($Universes.Count -gt 0) { $allUniverses = $Universes }
 elseif ($UniverseCount -gt 0) { $allUniverses = @($StartUniverse..($StartUniverse + $UniverseCount - 1)) }
@@ -114,6 +131,31 @@ $dmxValue        = [byte]0
 $ControlFile     = Join-Path (Split-Path $ConfigPath -Parent) "generator-control.json"
 $lastControlRead = [DateTime]::MinValue
 
+# F3: Burst / stress test mode — override rate and duration
+if ($Burst) {
+    if ($BurstHz -lt 1)   { $BurstHz = 100 }
+    if ($BurstHz -gt 500) { $BurstHz = 500 }
+    $intervalMs     = [int](1000.0 / $BurstHz)
+    $DurationSeconds = $BurstDurationSeconds
+}
+
+# F2: Scene stepping — load scene file if provided
+$scenes        = $null
+$sceneIndex    = 0
+$nextSceneTime = [DateTime]::MaxValue
+if ($SceneFile -and (Test-Path $SceneFile)) {
+    try {
+        $scenes = @(Get-Content $SceneFile -Raw | ConvertFrom-Json)
+        Write-Host "Scene file loaded: $($scenes.Count) cues from $(Split-Path $SceneFile -Leaf)" -ForegroundColor Cyan
+        if ($AutoStep) { $nextSceneTime = [DateTime]::Now }
+    } catch {
+        Write-Warning "Failed to load scene file '$SceneFile': $($_.Exception.Message)"
+        $scenes = $null
+    }
+} elseif ($SceneFile) {
+    Write-Warning "Scene file not found: $SceneFile"
+}
+
 Write-Host ""
 Write-Host "=== Art-Net Generator ===" -ForegroundColor Cyan
 Write-Host "Source NIC   : $(if ($boundSourceIP) { $boundSourceIP } elseif ($SourceIP) { "$SourceIP (bind failed - using OS default)" } else { '(OS default route)' })" -ForegroundColor Gray
@@ -121,6 +163,17 @@ Write-Host "Destination  : ${DestinationIP}:6454" -ForegroundColor Gray
 Write-Host "Universes    : $($activeUniverses -join ', ')  ($($activeUniverses.Count) active of $($allUniverses.Count) total)" -ForegroundColor Green
 Write-Host "Rate         : ~$PacketsPerSecond pkt/s per universe" -ForegroundColor Gray
 if ($DurationSeconds -gt 0) { Write-Host "Duration     : $DurationSeconds seconds" -ForegroundColor Gray } else { Write-Host "Duration     : until Ctrl+C" -ForegroundColor Gray }
+if ($channelOverrides.Count -gt 0) {
+    Write-Host "Ch Overrides : $($channelOverrides.Count) override(s) active" -ForegroundColor Gray
+}
+if ($Burst) {
+    Write-Host ""
+    Write-Host "  [STRESS TEST] Sending at $BurstHz Hz — this WILL trigger overload alerts" -ForegroundColor Red
+    Write-Host "  Auto-stops after $BurstDurationSeconds seconds" -ForegroundColor Red
+}
+if ($scenes) {
+    Write-Host "Scene mode   : $($scenes.Count) cues $(if ($AutoStep) { '(auto-step)' } else { '(manual - press Enter to advance)' })" -ForegroundColor Magenta
+}
 Write-Host ""
 Write-Host "Sending... (Ctrl+C to stop)" -ForegroundColor Yellow
 Write-Host ""
@@ -149,11 +202,55 @@ try {
         if ($Ramp) { $dmxValue = [byte](($dmxValue + 1) -band 0xFF) }
         else { $dmxValue = [byte]([Math]::Abs([Math]::Sin($packetCount * 0.05)) * 200) }
 
-        $dmxData = [byte[]]::new(512)
-        for ($i = 0; $i -lt 512; $i++) { $dmxData[$i] = $dmxValue }
+        # F2: advance scene cue if auto-step time has elapsed
+        if ($scenes -and $AutoStep -and [DateTime]::Now -ge $nextSceneTime) {
+            $curScene = $scenes[$sceneIndex % $scenes.Count]
+            $durMs    = if ($null -ne $curScene.duration_ms) { [int]$curScene.duration_ms } else { 2000 }
+            $sceneIndex++
+            $nextSceneTime = [DateTime]::Now.AddMilliseconds($durMs)
+            $cueLabel = if ($curScene.label) { $curScene.label } else { "Cue $($sceneIndex)" }
+            Write-Host "  [Scene] -> $cueLabel (hold ${durMs}ms)" -ForegroundColor Magenta
+        }
 
         $sendErrors = 0
         foreach ($uni in $activeUniverses) {
+            $dmxData = [byte[]]::new(512)
+
+            # F2: use scene data if a scene file is loaded, else normal fill
+            if ($scenes -and $scenes.Count -gt 0) {
+                $scene   = $scenes[$sceneIndex % $scenes.Count]
+                $uniKey  = "$uni"
+                $uniData = $null
+                if ($scene.channels) {
+                    try { $uniData = $scene.channels.$uniKey } catch {}
+                    if ($null -eq $uniData) {
+                        try { $uniData = $scene.channels.PSObject.Properties | Where-Object Name -eq $uniKey | Select-Object -First 1 -ExpandProperty Value } catch {}
+                    }
+                }
+                if ($uniData) {
+                    $arr = @($uniData)
+                    for ($i = 0; $i -lt 512 -and $i -lt $arr.Count; $i++) {
+                        $dmxData[$i] = [byte]([Math]::Max(0,[Math]::Min(255,[int]$arr[$i])))
+                    }
+                } else {
+                    for ($i = 0; $i -lt 512; $i++) { $dmxData[$i] = $dmxValue }
+                }
+            } else {
+                for ($i = 0; $i -lt 512; $i++) { $dmxData[$i] = $dmxValue }
+            }
+
+            # F1: apply per-channel overrides (universe + 1-based channel)
+            foreach ($ov in $channelOverrides) {
+                try {
+                    $ovUni = [int]$ov.universe
+                    $ovCh  = [int]$ov.channel
+                    $ovVal = [byte]([Math]::Max(0,[Math]::Min(255,[int]$ov.value)))
+                    if ($ovUni -eq $uni -and $ovCh -ge 1 -and $ovCh -le 512) {
+                        $dmxData[$ovCh - 1] = $ovVal
+                    }
+                } catch {}
+            }
+
             $uniBytes = [byte[]]([byte]($uni -band 0xFF), [byte](($uni -shr 8) -band 0x7F))
             $packet   = $headerPrefix + $uniBytes + $dmxLen + $dmxData
             try {
