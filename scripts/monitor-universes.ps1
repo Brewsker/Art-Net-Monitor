@@ -462,7 +462,7 @@ try {
                                 default { "Unknown OpCode 0x$('{0:X4}' -f $opCode)" }
                             }
                             if (([DateTime]::Now - $artCmdWarnTime).TotalSeconds -gt 30) {
-                                Write-Alert 'WARN' "Art-Net CONTROL packet from $srcIp: $opName"
+                                Write-Alert 'WARN' "Art-Net CONTROL packet from ${srcIp}: $opName"
                                 $artCmdWarnTime = [DateTime]::Now
                             }
                         }
