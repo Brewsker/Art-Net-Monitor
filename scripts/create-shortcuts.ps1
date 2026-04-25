@@ -6,7 +6,13 @@
 #   .\create-shortcuts.ps1
 
 $scriptsPath = "C:\AV-Monitoring\scripts"
-$shell = New-Object -ComObject WScript.Shell
+$shell = $null
+try {
+    $shell = New-Object -ComObject WScript.Shell
+} catch {
+    Write-Warning "Could not create WScript.Shell COM object: $_"
+    exit 1
+}
 $desktop = "$($shell.SpecialFolders('Desktop'))\Art-Net Sniffer"
 if (-not (Test-Path $desktop)) { New-Item -ItemType Directory -Path $desktop | Out-Null }
 
@@ -40,9 +46,13 @@ function New-ScriptShortcut {
     $sc.Save()
 
     # Set "Run as Administrator" flag (byte 0x15, bit 5 in the .lnk file)
-    $bytes = [System.IO.File]::ReadAllBytes($lnkPath)
-    $bytes[0x15] = $bytes[0x15] -bor 0x20
-    [System.IO.File]::WriteAllBytes($lnkPath, $bytes)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($lnkPath)
+        $bytes[0x15] = $bytes[0x15] -bor 0x20
+        [System.IO.File]::WriteAllBytes($lnkPath, $bytes)
+    } catch {
+        Write-Warning "  Could not set Run-as-Administrator flag on $Name.lnk : $_"
+    }
 
     Write-Host "  Created: $Name.lnk" -ForegroundColor Green
 }

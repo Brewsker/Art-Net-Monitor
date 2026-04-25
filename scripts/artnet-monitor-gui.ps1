@@ -934,9 +934,13 @@ $btnTestEmail.Add_Click({
     if (Test-Path $ConfigPath) {
         try {
             $cfgRaw2 = Get-Content $ConfigPath -Raw
-            $cfgRaw2 = $cfgRaw2 -replace '("from_address"\s*:\s*)"[^"]*"', "`${1}`"$from`""
-            $cfgRaw2 = $cfgRaw2 -replace '("app_password"\s*:\s*)"[^"]*"',  "`${1}`"$pass`""
-            $cfgRaw2 = $cfgRaw2 -replace '("to_address"\s*:\s*)"[^"]*"',    "`${1}`"$to`""
+            # Escape $ in replacement values to prevent regex backreference expansion
+            $safeFrom = $from -replace '\$', '$$$$'
+            $safePass = $pass -replace '\$', '$$$$'
+            $safeTo   = $to   -replace '\$', '$$$$'
+            $cfgRaw2 = $cfgRaw2 -replace '("from_address"\s*:\s*)"[^"]*"', "`${1}`"$safeFrom`""
+            $cfgRaw2 = $cfgRaw2 -replace '("app_password"\s*:\s*)"[^"]*"',  "`${1}`"$safePass`""
+            $cfgRaw2 = $cfgRaw2 -replace '("to_address"\s*:\s*)"[^"]*"',    "`${1}`"$safeTo`""
             Set-Content $ConfigPath $cfgRaw2 -Encoding UTF8
             Load-Config
         } catch {}

@@ -54,7 +54,7 @@ $detectARPConflict = $true  # warn on ARP IP-MAC changes (node IP conflict = net
 $warnArtCommand   = $true  # warn on ArtAddress/ArtInput packets that reconfigure node ports
 
 # ---------------------------------------------------------------------------
-# Load config.json
+# Load config.json (single pass - monitoring + email settings)
 # ---------------------------------------------------------------------------
 if (Test-Path $ConfigPath) {
     try {
@@ -69,10 +69,10 @@ if (Test-Path $ConfigPath) {
         if ($null -ne $cfg.monitoring.duplicate_source_warn) { $warnDuplicate    = [bool]$cfg.monitoring.duplicate_source_warn }
         if ($cfg.monitoring.check_interval_ms)               { $checkIntervalMs  = [int]$cfg.monitoring.check_interval_ms }
         if ($cfg.monitoring.startup_grace_seconds)           { $startupGrace     = [int]$cfg.monitoring.startup_grace_seconds }
-        if ($cfg.monitoring.rate_warn_hz)                     { $rateWarnHz        = [int]$cfg.monitoring.rate_warn_hz }
-        if ($null -ne $cfg.monitoring.detect_sacn)            { $detectSACN        = [bool]$cfg.monitoring.detect_sacn }
-        if ($null -ne $cfg.monitoring.detect_arp_conflict)    { $detectARPConflict = [bool]$cfg.monitoring.detect_arp_conflict }
-        if ($null -ne $cfg.monitoring.warn_art_command)       { $warnArtCommand    = [bool]$cfg.monitoring.warn_art_command }
+        if ($cfg.monitoring.rate_warn_hz)                    { $rateWarnHz       = [int]$cfg.monitoring.rate_warn_hz }
+        if ($null -ne $cfg.monitoring.detect_sacn)           { $detectSACN       = [bool]$cfg.monitoring.detect_sacn }
+        if ($null -ne $cfg.monitoring.detect_arp_conflict)   { $detectARPConflict = [bool]$cfg.monitoring.detect_arp_conflict }
+        if ($null -ne $cfg.monitoring.warn_art_command)      { $warnArtCommand   = [bool]$cfg.monitoring.warn_art_command }
     } catch {
         Write-Warning "Could not fully load $ConfigPath : $_  -- Using defaults."
     }
@@ -82,29 +82,27 @@ if (Test-Path $ConfigPath) {
 
 # ---------------------------------------------------------------------------
 # Email configuration (from config.json [email] section)
+# Password is NOT stored globally - read from config only at send time
 # ---------------------------------------------------------------------------
 $emailEnabled    = $false
 $smtpServer      = "smtp.gmail.com"
 $smtpPort        = 587
 $smtpUseSSL      = $true
 $emailFrom       = ""
-$emailAppPass    = ""
 $emailTo         = ""
 $emailAlertTypes = @("ALERT", "RECOVERY")
 
 if (Test-Path $ConfigPath) {
     try {
-        $cfgFull = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-        if ($cfgFull.email) {
-            $em = $cfgFull.email
-            if ($null -ne $em.enabled)      { $emailEnabled    = [bool]$em.enabled }
-            if ($em.smtp_server)            { $smtpServer      = $em.smtp_server }
-            if ($em.smtp_port)              { $smtpPort        = [int]$em.smtp_port }
-            if ($null -ne $em.use_ssl)      { $smtpUseSSL      = [bool]$em.use_ssl }
-            if ($em.from_address)           { $emailFrom       = $em.from_address }
-            if ($em.app_password)           { $emailAppPass    = $em.app_password }
-            if ($em.to_address)             { $emailTo         = $em.to_address }
-            if ($em.alert_types)            { $emailAlertTypes = @($em.alert_types) }
+        $emCfg = $cfg.email
+        if ($emCfg) {
+            if ($null -ne $emCfg.enabled)      { $emailEnabled    = [bool]$emCfg.enabled }
+            if ($emCfg.smtp_server)            { $smtpServer      = $emCfg.smtp_server }
+            if ($emCfg.smtp_port)              { $smtpPort        = [int]$emCfg.smtp_port }
+            if ($null -ne $emCfg.use_ssl)      { $smtpUseSSL      = [bool]$emCfg.use_ssl }
+            if ($emCfg.from_address)           { $emailFrom       = $emCfg.from_address }
+            if ($emCfg.to_address)             { $emailTo         = $emCfg.to_address }
+            if ($emCfg.alert_types)            { $emailAlertTypes = @($emCfg.alert_types) }
         }
     } catch {}
 }
@@ -113,8 +111,14 @@ function Send-AlertEmail {
     param([string]$Type, [string]$Message)
     if (-not $emailEnabled)                          { return }
     if ($emailAlertTypes -notcontains $Type)         { return }
-    if (-not $emailFrom -or -not $emailTo -or
-        -not $emailAppPass -or $emailAppPass -match '^xxxx') { return }
+    if (-not $emailFrom -or -not $emailTo)           { return }
+    # Read password from config at send time only - never kept in global scope
+    $sendPass = ''
+    try {
+        $sendCfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        if ($sendCfg.email.app_password) { $sendPass = $sendCfg.email.app_password }
+    } catch {}
+    if (-not $sendPass -or $sendPass -match '^xxxx')     { return }
     try {
         $subject = "[Art-Net Monitor] $Type on $(hostname)"
         $body    = "$Message`r`n`r`nTime: $(Get-Date)`r`nHost: $(hostname)"
@@ -122,7 +126,7 @@ function Send-AlertEmail {
         $smtp2.EnableSsl = $smtpUseSSL
         $smtp2.DeliveryMethod = [System.Net.Mail.SmtpDeliveryMethod]::Network
         $smtp2.UseDefaultCredentials = $false
-        $smtp2.Credentials = New-Object System.Net.NetworkCredential($emailFrom, $emailAppPass)
+        $smtp2.Credentials = New-Object System.Net.NetworkCredential($emailFrom, $sendPass)
         $msg2 = New-Object System.Net.Mail.MailMessage
         $msg2.From = $emailFrom
         $msg2.To.Add($emailTo)
@@ -138,6 +142,9 @@ function Send-AlertEmail {
         Write-Host "[WARN] Email send failed: $errMsg2" -ForegroundColor Yellow
         $ts2 = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         Add-Content -Path $alertsLog -Value "[WARN] [$ts2] Email send failed: $errMsg2"
+    } finally {
+        $sendPass = $null
+        Remove-Variable sendPass -ErrorAction SilentlyContinue
     }
 }
 
@@ -405,11 +412,13 @@ try {
                 # lose network access and all its universes will drop.
                 # ==========================================================
                 if ($detectARPConflict -and $arpSrcIP -ne '' -and $arpSrcMAC -ne '') {
+                    # Normalize MAC to uppercase hex digits only for reliable comparison
+                    $normMAC = ($arpSrcMAC -replace '[^0-9A-Fa-f]', '').ToUpper()
                     if (-not $arpTable.ContainsKey($arpSrcIP)) {
-                        $arpTable[$arpSrcIP] = $arpSrcMAC
-                    } elseif ($arpTable[$arpSrcIP] -ne $arpSrcMAC) {
-                        Write-Alert 'WARN' "ARP IP conflict: $arpSrcIP changed from MAC $($arpTable[$arpSrcIP]) to $arpSrcMAC - if this is an eNode IP it has lost network access!"
-                        $arpTable[$arpSrcIP] = $arpSrcMAC
+                        $arpTable[$arpSrcIP] = $normMAC
+                    } elseif ($arpTable[$arpSrcIP] -ne $normMAC) {
+                        Write-Alert 'WARN' "ARP IP conflict: $arpSrcIP changed from MAC $($arpTable[$arpSrcIP]) to $normMAC - if this is an eNode IP it has lost network access!"
+                        $arpTable[$arpSrcIP] = $normMAC
                     }
                 }
 

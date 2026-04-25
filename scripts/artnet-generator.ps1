@@ -168,7 +168,7 @@ try {
         }
 
         $elapsed = ([DateTime]::Now - $startTime).TotalSeconds
-        $uniCount = if ($activeUniverses) { @($activeUniverses).Count } else { 0 }
+        $uniCount = if ($activeUniverses) { $activeUniverses.Count } else { 0 }
         $reportEvery = $PacketsPerSecond * $uniCount * 5
         if ($reportEvery -gt 0 -and $packetCount % $reportEvery -eq 0) {
             $rate = [Math]::Round($packetCount / [Math]::Max(1, $elapsed))
@@ -179,7 +179,7 @@ try {
         Start-Sleep -Milliseconds $intervalMs
     }
 } finally {
-    $udpClient.Close()
+    $udpClient.Dispose()
     Write-Host ""
     Write-Host "Generator stopped. Sent $packetCount packets across $($activeUniverses.Count) universes." -ForegroundColor Green
     Write-Host ""
