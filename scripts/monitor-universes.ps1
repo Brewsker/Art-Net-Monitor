@@ -29,7 +29,7 @@
 #   - Jitter: high stddev in inter-packet arrival times signals upstream network congestion
 
 param(
-    # Override interface from config.json
+    # Override interface from config.json (single interface, backward-compat)
     [int]$InterfaceId    = 0,
 
     # Override timeout from config.json
@@ -45,6 +45,7 @@ $tsharkPath       = "C:\Program Files\Wireshark\tshark.exe"
 $alertsLog        = "C:\AV-Monitoring\logs\alerts.log"
 $logsDir          = "C:\AV-Monitoring\logs"
 $captureInterface = 8
+$captureInterfaces = @()   # multi-interface: set via capture.interface_ids array in config
 $captureFilter    = "udp port 6454"
 $timeoutSecs      = 2
 $expectedUnis     = @(0, 1, 2, 3)
@@ -76,6 +77,10 @@ if (Test-Path $ConfigPath) {
         if ($cfg.paths.logs)                                 { $logsDir          = $cfg.paths.logs }
         if ($cfg.paths.captures)                             { $capturesDir      = $cfg.paths.captures }
         if ($cfg.capture.interface_id)                       { $captureInterface = [int]$cfg.capture.interface_id }
+        # Multi-interface: interface_ids array overrides the scalar interface_id
+        if ($cfg.capture.interface_ids -and $cfg.capture.interface_ids.Count -gt 0) {
+            $captureInterfaces = @($cfg.capture.interface_ids | ForEach-Object { [int]$_ })
+        }
         if ($cfg.capture.filter)                             { $captureFilter    = $cfg.capture.filter }
         if ($cfg.monitoring.timeout_seconds)                 { $timeoutSecs      = [int]$cfg.monitoring.timeout_seconds }
         if ($cfg.monitoring.expected_universes)              { $expectedUnis     = $cfg.monitoring.expected_universes }
@@ -175,6 +180,9 @@ function Send-AlertEmail {
 if ($InterfaceId    -gt 0) { $captureInterface = $InterfaceId }
 if ($TimeoutSeconds -gt 0) { $timeoutSecs      = $TimeoutSeconds }
 
+# Build effective interface list: multi-interface array takes precedence over scalar
+if ($captureInterfaces.Count -eq 0) { $captureInterfaces = @($captureInterface) }
+
 # ---------------------------------------------------------------------------
 # Validate
 # ---------------------------------------------------------------------------
@@ -182,8 +190,8 @@ if (-not (Test-Path $tsharkPath)) {
     Write-Error "tshark not found at: $tsharkPath"
     exit 1
 }
-if ($captureInterface -le 0) {
-    Write-Error "No capture interface set. Edit config.json (interface_id) or pass -InterfaceId."
+if ($captureInterfaces.Count -eq 0 -or ($captureInterfaces.Count -eq 1 -and $captureInterfaces[0] -le 0)) {
+    Write-Error "No capture interface set. Edit config.json (capture.interface_id or capture.interface_ids) or pass -InterfaceId."
     exit 1
 }
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir | Out-Null }
@@ -543,38 +551,40 @@ function Write-UniverseStatus {
     }
     $payload = [ordered]@{ updated = $now.ToString('yyyy-MM-ddTHH:mm:ss'); universes = $uniData }
     try {
-        $tmp = "$statusJsonPath.tmp"
-        $payload | ConvertTo-Json -Depth 4 | Set-Content $tmp -Encoding UTF8 -Force
-        Move-Item -Path $tmp -Destination $statusJsonPath -Force
+        $json  = $payload | ConvertTo-Json -Depth 4
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $fs    = [System.IO.File]::Open($statusJsonPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Close()
     } catch {}
 }
 
 # ---------------------------------------------------------------------------
-# Start tshark process (non-interactive, stdout redirected)
+# Build tshark argument template (interface substituted per-process)
 # ---------------------------------------------------------------------------
-# Capture Art-Net (6454), sACN (5568), and ARP - the three protocol classes that
-# can directly cause an eNode to fault a DMX port.
-$tsharkArgs = @(
-    "-i", $captureInterface,
-    "-f", "`"(udp port 6454) or (udp port 5568) or arp`"",
-    "-s", "80",
-    "-T", "fields",
-    "-e", "frame.time_epoch",
-    "-e", "ip.src",
-    "-e", "ip.dst",
-    "-e", "udp.dstport",
-    "-e", "udp.payload",              # Raw hex payload for Art-Net parsing
-    "-e", "arp.src.proto_ipv4",       # ARP sender IP  (IP conflict detection)
-    "-e", "arp.src.hw_mac",           # ARP sender MAC (IP conflict detection)
-    "-E", "separator=|",
-    "-l"
-)
+function Get-TsharkArgs([int]$ifaceId) {
+    return @(
+        "-i", $ifaceId,
+        "-f", "`"(udp port 6454) or (udp port 5568) or arp`"",
+        "-s", "80",
+        "-T", "fields",
+        "-e", "frame.time_epoch",
+        "-e", "ip.src",
+        "-e", "ip.dst",
+        "-e", "udp.dstport",
+        "-e", "udp.payload",
+        "-e", "arp.src.proto_ipv4",
+        "-e", "arp.src.hw_mac",
+        "-E", "separator=|",
+        "-l"
+    )
+}
 
 Write-Host ""
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host "   Art-Net Universe Monitor" -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
-Write-Host "Interface     : $captureInterface" -ForegroundColor Gray
+Write-Host "Interfaces    : $($captureInterfaces -join ', ')" -ForegroundColor Gray
 Write-Host "Timeout       : ${timeoutSecs}s" -ForegroundColor Gray
 Write-Host "Expected unis : $($expectedUnis -join ', ')" -ForegroundColor Gray
 Write-Host "Grace period  : ${startupGrace}s" -ForegroundColor Gray
@@ -585,34 +595,41 @@ Write-Host ""
 Write-Host "Events will appear below. Press Ctrl+C to stop." -ForegroundColor Yellow
 Write-Host ""
 Rotate-AlertsLog
-Write-Alert "INFO" "Monitor started - interface:$captureInterface  universes:$($expectedUnis -join ',')  timeout:${timeoutSecs}s"
+Write-Alert "INFO" "Monitor started - interfaces:$($captureInterfaces -join ',')  universes:$($expectedUnis -join ',')  timeout:${timeoutSecs}s"
 
 # ---------------------------------------------------------------------------
 # Start tshark and run main monitoring loop
 # ---------------------------------------------------------------------------
-$proc = $null
+$procs     = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+$readers   = $null   # array of Task<string>, one per process
+$proc      = $null   # kept for single-interface backward-compat reference in finally
 try {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName               = $tsharkPath
-    $psi.Arguments              = $tsharkArgs -join " "
-    $psi.RedirectStandardOutput = $true
-    $psi.UseShellExecute        = $false
-    $psi.CreateNoWindow         = $true
+    # Start one tshark process per interface
+    foreach ($ifaceId in $captureInterfaces) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $tsharkPath
+        $psi.Arguments              = (Get-TsharkArgs $ifaceId) -join " "
+        $psi.RedirectStandardOutput = $true
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if ($null -eq $p) { throw "Process.Start returned null for interface $ifaceId - tshark failed to launch." }
+        $procs.Add($p)
+    }
+    $proc = $procs[0]  # reference for legacy finally cleanup
 
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    if ($null -eq $proc) { throw "Process.Start returned null - tshark failed to launch." }
-
-    $readTask = $proc.StandardOutput.ReadLineAsync()
+    # Seed one outstanding ReadLineAsync per process
+    $readers = $procs | ForEach-Object { $_.StandardOutput.ReadLineAsync() }
+    $readers = [System.Threading.Tasks.Task[]]$readers
 
     while ($true) {
-        # Wait up to checkIntervalMs for the next line from tshark
-        $completed = $false
-        try { $completed = $readTask.Wait($checkIntervalMs) } catch { break }
+        # Wait up to checkIntervalMs for ANY process to produce a line
+        $idx = [System.Threading.Tasks.Task]::WaitAny($readers, $checkIntervalMs)
 
-        if ($completed) {
+        if ($idx -ge 0) {
             $line = $null
-            try { $line = $readTask.Result } catch { break }
-            if ($null -eq $line) { break }  # tshark stdout closed (process ended)
+            try { $line = $readers[$idx].Result } catch { break }
+            if ($null -eq $line) { break }  # stdout closed (process ended)
 
             if (-not [string]::IsNullOrWhiteSpace($line)) {
                 # Field layout (tshark -T fields):
@@ -813,7 +830,8 @@ try {
                 }
             }
 
-            $readTask = $proc.StandardOutput.ReadLineAsync()
+            # Re-arm this reader for the next line from the same process
+            $readers[$idx] = $procs[$idx].StandardOutput.ReadLineAsync()
         }
 
         # Always check timeouts (even when no packets arrive)
@@ -831,8 +849,10 @@ try {
     Write-Host "ERROR: $_" -ForegroundColor Red
     Write-Host ""
 } finally {
-    if ($null -ne $proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
-    try { if ($null -ne $proc) { $proc.Dispose() } } catch {}
+    foreach ($p in $procs) {
+        if ($null -ne $p -and -not $p.HasExited) { try { $p.Kill() } catch {} }
+        try { if ($null -ne $p) { $p.Dispose() } } catch {}
+    }
 
     $exitCode = if ($null -ne $proc -and $proc.HasExited) { $proc.ExitCode } else { "N/A" }
     Write-StatusSummary
