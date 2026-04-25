@@ -23,6 +23,10 @@
 #     These can reconfigure or disable eNode port directions live
 #   - ARP IP conflict: another device is claiming a node's IP address
 #     Node loses network access; all universes on that node disappear
+#   - Sequence discontinuity: skipped or repeated ArtDmx sequence numbers indicate packet loss
+#   - Source IP hijack: primary sender for a universe silently changes IP mid-show
+#   - Node reboot: short-gap same-IP recovery fingerprinted as power-cycle vs true drop
+#   - Jitter: high stddev in inter-packet arrival times signals upstream network congestion
 
 param(
     # Override interface from config.json
@@ -49,9 +53,12 @@ $checkIntervalMs  = 500
 $startupGrace     = 5    # seconds before alerting on never-seen expected universes
 $statusInterval   = 30   # seconds between periodic status summaries
 $rateWarnHz       = 44   # Art-Net spec max pkt/s per universe (node buffer fault threshold)
+$jitterWarnMs     = 5    # stddev threshold (ms) for inter-packet jitter alert
 $detectSACN       = $true  # warn if sACN appears for a monitored universe (eNode auto-switches)
 $detectARPConflict = $true  # warn on ARP IP-MAC changes (node IP conflict = network blackout)
 $warnArtCommand   = $true  # warn on ArtAddress/ArtInput packets that reconfigure node ports
+$suppressStart    = ""    # "HH:mm" suppress alert emails from this time (24h); "" = disabled
+$suppressEnd      = ""    # "HH:mm" suppress alert emails until this time (24h); "" = disabled
 $logMaxSizeMB     = 5      # max alerts.log size in MB before rotation
 $logKeepCount     = 3      # number of rotated log files to keep
 $capturesDir      = "C:\AV-Monitoring\captures"  # directory for .pcap alert captures
@@ -76,6 +83,7 @@ if (Test-Path $ConfigPath) {
         if ($cfg.monitoring.check_interval_ms)               { $checkIntervalMs  = [int]$cfg.monitoring.check_interval_ms }
         if ($cfg.monitoring.startup_grace_seconds)           { $startupGrace     = [int]$cfg.monitoring.startup_grace_seconds }
         if ($cfg.monitoring.rate_warn_hz)                    { $rateWarnHz       = [int]$cfg.monitoring.rate_warn_hz }
+        if ($cfg.monitoring.jitter_warn_ms)                  { $jitterWarnMs     = [int]$cfg.monitoring.jitter_warn_ms }
         if ($null -ne $cfg.monitoring.detect_sacn)           { $detectSACN       = [bool]$cfg.monitoring.detect_sacn }
         if ($null -ne $cfg.monitoring.detect_arp_conflict)   { $detectARPConflict = [bool]$cfg.monitoring.detect_arp_conflict }
         if ($null -ne $cfg.monitoring.warn_art_command)      { $warnArtCommand   = [bool]$cfg.monitoring.warn_art_command }
@@ -83,12 +91,17 @@ if (Test-Path $ConfigPath) {
         if ($cfg.logging.keep_count)                         { $logKeepCount     = [int]$cfg.logging.keep_count }
         if ($null -ne $cfg.logging.capture_on_alert)         { $captureOnAlert   = [bool]$cfg.logging.capture_on_alert }
         if ($cfg.logging.capture_duration_seconds)           { $captureDurationSecs = [int]$cfg.logging.capture_duration_seconds }
+        if ($cfg.monitoring.suppress_start) { $suppressStart = $cfg.monitoring.suppress_start }
+        if ($cfg.monitoring.suppress_end)   { $suppressEnd   = $cfg.monitoring.suppress_end }
     } catch {
         Write-Warning "Could not fully load $ConfigPath : $_  -- Using defaults."
     }
 } else {
     Write-Warning "config.json not found at $ConfigPath. Using defaults."
 }
+
+# Path for GUI health-grid status file (derived after config sets $logsDir)
+$statusJsonPath = Join-Path $logsDir "universe-status.json"
 
 # ---------------------------------------------------------------------------
 # Email configuration (from config.json [email] section)
@@ -191,7 +204,25 @@ function Write-Alert {
     }
     Write-Host $entry -ForegroundColor $color
     Add-Content -Path $alertsLog -Value $entry
-    Send-AlertEmail -Type $Type -Message $Message
+    # Check alert suppression window — still write to log, but skip email when suppressed
+    $script:emailSuppressed = $false
+    if ($suppressStart -and $suppressEnd) {
+        $nowT    = [DateTime]::Now
+        $nowMins = $nowT.Hour * 60 + $nowT.Minute
+        $sParts  = $suppressStart -split ':'
+        $eParts  = $suppressEnd   -split ':'
+        if ($sParts.Count -eq 2 -and $eParts.Count -eq 2) {
+            $sMins = [int]$sParts[0] * 60 + [int]$sParts[1]
+            $eMins = [int]$eParts[0] * 60 + [int]$eParts[1]
+            if ($sMins -le $eMins) {
+                $script:emailSuppressed = ($nowMins -ge $sMins -and $nowMins -lt $eMins)
+            } else {
+                # Window spans midnight
+                $script:emailSuppressed = ($nowMins -ge $sMins -or $nowMins -lt $eMins)
+            }
+        }
+    }
+    if (-not $script:emailSuppressed) { Send-AlertEmail -Type $Type -Message $Message }
     if ($Type -eq 'ALERT')    { $script:sessionAlertCount++; Start-AlertCapture -AlertMessage $Message }
     if ($Type -eq 'RECOVERY') { $script:sessionRecoveryCount++ }
 }
@@ -334,7 +365,7 @@ function Get-ArtNetUniverse([string]$hexRaw) {
 # ---------------------------------------------------------------------------
 # Universe tracking state
 # Table key: universe number (int)
-# Entry: @{ LastSeen=DateTime|null; Sources=@{ip=>count}; Alerted=bool; WarnedDup=bool; EverSeen=bool }
+# Entry: @{ LastSeen; Sources; Alerted; WarnedDup; EverSeen; RateAlerted; LastSeq; PrimarySource; PrimaryLastSeen; HijackWarned; AlertTime; LastSourceBeforeAlert; JitterAlerted }
 # ---------------------------------------------------------------------------
 $universeTable  = @{}
 $monitorStart   = [DateTime]::Now
@@ -346,12 +377,19 @@ $script:sessionRecoveryCount = 0
 function Initialize-Universe([int]$uni) {
     if (-not $universeTable.ContainsKey($uni)) {
         $universeTable[$uni] = @{
-            LastSeen    = $null
-            Sources     = @{}
-            Alerted     = $false
-            WarnedDup   = $false
-            EverSeen    = $false
-            RateAlerted = $false
+            LastSeen              = $null
+            Sources               = @{}
+            Alerted               = $false
+            WarnedDup             = $false
+            EverSeen              = $false
+            RateAlerted           = $false
+            LastSeq               = -1      # Feature 1: last seen sequence byte (-1 = not yet seen)
+            PrimarySource         = $null   # Feature 2: established primary sender IP
+            PrimaryLastSeen       = $null   # Feature 2: last packet time from primary source
+            HijackWarned          = $false  # Feature 2: hijack alert already fired
+            AlertTime             = $null   # Feature 3: when the drop alert fired
+            LastSourceBeforeAlert = $null   # Feature 3: dominant source IP at alert time
+            JitterAlerted         = $false  # Feature 4: jitter alert currently active
         }
     }
 }
@@ -379,6 +417,18 @@ function Get-ArtNetOpCode([string]$hexRaw) {
     $opLow  = [Convert]::ToByte($hex.Substring(16, 2), 16)
     $opHigh = [Convert]::ToByte($hex.Substring(18, 2), 16)
     return ($opHigh -shl 8) -bor $opLow
+}
+
+# Returns ArtDmx sequence byte (0 = sequencing disabled), or $null if not ArtDmx
+function Get-ArtNetSequence([string]$hexRaw) {
+    $hex = $hexRaw -replace '[^0-9a-fA-F]', ''
+    if ($hex.Length -lt 32) { return $null }
+    if ($hex.Substring(0, 16).ToLower() -ne '4172742d4e657400') { return $null }
+    try {
+        if ([Convert]::ToByte($hex.Substring(16, 2), 16) -ne 0x00) { return $null }
+        if ([Convert]::ToByte($hex.Substring(18, 2), 16) -ne 0x50) { return $null }
+        return [int][Convert]::ToByte($hex.Substring(24, 2), 16)
+    } catch { return $null }
 }
 
 # Returns sACN universe from multicast destination IP 239.255.X.Y, or $null
@@ -414,6 +464,9 @@ function Invoke-TimeoutCheck {
             $lastSeenStr = $entry.LastSeen.ToString("HH:mm:ss")
             Write-Alert "ALERT" "Universe $uni missing for >${timeoutSecs}s (last seen: $lastSeenStr)"
             $universeTable[$uni].Alerted = $true
+            # Feature 3: record alert context for reboot fingerprinting on recovery
+            $universeTable[$uni].AlertTime = $now
+            $universeTable[$uni].LastSourceBeforeAlert = ($entry.Sources.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
         }
     }
 }
@@ -452,6 +505,10 @@ function Write-StatusSummary {
     if ($rateOverloads.Count -gt 0) {
         Write-Host "  RATE OVERLOAD on U: $($rateOverloads -join ', ')" -ForegroundColor Red
     }
+    $jitterAlerts = @($universeTable.Keys | Where-Object { $universeTable[$_].JitterAlerted })
+    if ($jitterAlerts.Count -gt 0) {
+        Write-Host "  HIGH JITTER on U: $($jitterAlerts -join ', ')" -ForegroundColor Yellow
+    }
     if ($sacnWarnTimes.Count -gt 0) {
         Write-Host "  sACN conflict detected for U: $($sacnWarnTimes.Keys -join ', ')" -ForegroundColor Yellow
     }
@@ -459,6 +516,37 @@ function Write-StatusSummary {
         Write-Host "  ARP table: $($arpTable.Count) IPs tracked" -ForegroundColor DarkGray
     }
     Write-Host ""
+}
+
+# ---------------------------------------------------------------------------
+# Universe status JSON (read by the GUI health-grid every ~2 s)
+# Written atomically via temp-file + rename to avoid partial JSON reads.
+# ---------------------------------------------------------------------------
+function Write-UniverseStatus {
+    $now     = [DateTime]::Now
+    $uniData = [ordered]@{}
+    foreach ($uni in ($universeTable.Keys | Sort-Object)) {
+        $e     = $universeTable[$uni]
+        $age   = if ($e.EverSeen) { [math]::Round(($now - $e.LastSeen).TotalSeconds, 1) } else { 9999 }
+        $hz    = if ($uniRateQ.ContainsKey($uni)) { $uniRateQ[$uni].Count } else { 0 }
+        $state = if (-not $e.EverSeen)   { 'NEVER_SEEN' }
+                 elseif ($e.Alerted)     { 'DROPPED' }
+                 elseif ($e.RateAlerted) { 'OVERLOAD' }
+                 else                    { 'OK' }
+        $uniData["$uni"] = [ordered]@{
+            state         = $state
+            last_seen_age = $age
+            hz            = $hz
+            sources       = $e.Sources.Count
+            ever_seen     = $e.EverSeen
+        }
+    }
+    $payload = [ordered]@{ updated = $now.ToString('yyyy-MM-ddTHH:mm:ss'); universes = $uniData }
+    try {
+        $tmp = "$statusJsonPath.tmp"
+        $payload | ConvertTo-Json -Depth 4 | Set-Content $tmp -Encoding UTF8 -Force
+        Move-Item -Path $tmp -Destination $statusJsonPath -Force
+    } catch {}
 }
 
 # ---------------------------------------------------------------------------
@@ -491,7 +579,7 @@ Write-Host "Timeout       : ${timeoutSecs}s" -ForegroundColor Gray
 Write-Host "Expected unis : $($expectedUnis -join ', ')" -ForegroundColor Gray
 Write-Host "Grace period  : ${startupGrace}s" -ForegroundColor Gray
 Write-Host "Alerts log    : $alertsLog" -ForegroundColor Gray
-Write-Host "Fault detection: rate>${rateWarnHz}Hz | sACN=$(if($detectSACN){'on'}else{'off'}) | ARP=$(if($detectARPConflict){'on'}else{'off'}) | ArtCmd=$(if($warnArtCommand){'on'}else{'off'})" -ForegroundColor DarkGray
+Write-Host "Fault detection: rate>${rateWarnHz}Hz | jitter>${jitterWarnMs}ms | sACN=$(if($detectSACN){'on'}else{'off'}) | ARP=$(if($detectARPConflict){'on'}else{'off'}) | ArtCmd=$(if($warnArtCommand){'on'}else{'off'})" -ForegroundColor DarkGray
 Write-Host "Log rotation    : max=${logMaxSizeMB}MB keep=${logKeepCount} | Alert capture: $(if($captureOnAlert){'on ('+$captureDurationSecs+'s)'}else{'off'})" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Events will appear below. Press Ctrl+C to stop." -ForegroundColor Yellow
@@ -628,11 +716,41 @@ try {
                             $universeTable[$universe].RateAlerted = $false
                         }
 
+                        # --- Inter-packet jitter (Feature 4) ---
+                        if ($uniRateQ[$universe].Count -ge 5) {
+                            $times    = $uniRateQ[$universe].ToArray()
+                            $gapSum   = 0.0; $gapSumSq = 0.0; $gapN = $times.Count - 1
+                            for ($gi = 1; $gi -lt $times.Count; $gi++) {
+                                $g = ($times[$gi] - $times[$gi-1]).TotalMilliseconds
+                                $gapSum += $g; $gapSumSq += $g * $g
+                            }
+                            $meanMs   = $gapSum / $gapN
+                            $stddevMs = [Math]::Round([Math]::Sqrt([Math]::Max(0, ($gapSumSq / $gapN) - $meanMs * $meanMs)), 1)
+                            if ($stddevMs -gt $jitterWarnMs -and -not $universeTable[$universe].JitterAlerted) {
+                                Write-Alert 'WARN' "Universe $universe jitter: stddev ${stddevMs}ms exceeds ${jitterWarnMs}ms threshold - network congestion likely"
+                                $universeTable[$universe].JitterAlerted = $true
+                            } elseif ($stddevMs -le $jitterWarnMs -and $universeTable[$universe].JitterAlerted) {
+                                Write-Alert 'INFO' "Universe $universe jitter normalized: stddev ${stddevMs}ms"
+                                $universeTable[$universe].JitterAlerted = $false
+                            }
+                        }
+
                         # Recovery: universe was alerted but traffic resumed
                         if ($universeTable[$universe].Alerted) {
-                            Write-Alert 'RECOVERY' "Universe $universe resumed (from $srcIp)"
-                            $universeTable[$universe].Alerted   = $false
-                            $universeTable[$universe].WarnedDup = $false
+                            # Feature 3: fingerprint short-gap same-IP return as node reboot
+                            $alertAge = if ($null -ne $universeTable[$universe].AlertTime) {
+                                ($now - $universeTable[$universe].AlertTime).TotalSeconds
+                            } else { 9999 }
+                            $prevSrc = $universeTable[$universe].LastSourceBeforeAlert
+                            if ($alertAge -lt 30 -and $null -ne $prevSrc -and $srcIp -eq $prevSrc) {
+                                Write-Alert 'INFO' "Universe $universe source ${srcIp} rebooted (gap: $([int]$alertAge)s)"
+                            } else {
+                                Write-Alert 'RECOVERY' "Universe $universe resumed (from $srcIp)"
+                            }
+                            $universeTable[$universe].Alerted        = $false
+                            $universeTable[$universe].WarnedDup      = $false
+                            $universeTable[$universe].LastSeq        = -1
+                            $universeTable[$universe].JitterAlerted  = $false
                         }
 
                         # First time we see this universe
@@ -643,11 +761,45 @@ try {
 
                         $universeTable[$universe].LastSeen = $now
 
+                        # --- Sequence discontinuity tracking (Feature 1) ---
+                        $seq = Get-ArtNetSequence $hexPay
+                        if ($null -ne $seq -and $seq -ne 0 -and $universeTable[$universe].LastSeq -ge 0) {
+                            $prevSeq     = $universeTable[$universe].LastSeq
+                            $expectedSeq = if ($prevSeq -ge 255) { 1 } else { $prevSeq + 1 }
+                            if ($seq -ne $expectedSeq) {
+                                Write-Alert 'WARN' "Universe $universe sequence gap: expected $expectedSeq got $seq (delta: $($seq - $prevSeq))"
+                            }
+                        }
+                        if ($null -ne $seq -and $seq -ne 0) { $universeTable[$universe].LastSeq = $seq }
+
                         # Track source IPs
                         if (-not $universeTable[$universe].Sources.ContainsKey($srcIp)) {
                             $universeTable[$universe].Sources[$srcIp] = 0
                         }
                         $universeTable[$universe].Sources[$srcIp]++
+
+                        # --- Source IP hijack detection (Feature 2) ---
+                        $uptime = ($now - $monitorStart).TotalSeconds
+                        if ($uptime -gt $startupGrace) {
+                            if ($null -eq $universeTable[$universe].PrimarySource) {
+                                $universeTable[$universe].PrimarySource   = $srcIp
+                                $universeTable[$universe].PrimaryLastSeen = $now
+                            } elseif ($srcIp -eq $universeTable[$universe].PrimarySource) {
+                                $universeTable[$universe].PrimaryLastSeen = $now
+                                if ($universeTable[$universe].HijackWarned) {
+                                    Write-Alert 'INFO' "Universe $universe primary source ${srcIp} resumed sending"
+                                    $universeTable[$universe].HijackWarned = $false
+                                }
+                            } else {
+                                $primarySilent = if ($null -ne $universeTable[$universe].PrimaryLastSeen) {
+                                    ($now - $universeTable[$universe].PrimaryLastSeen).TotalSeconds
+                                } else { 9999 }
+                                if ($primarySilent -gt $timeoutSecs -and -not $universeTable[$universe].HijackWarned) {
+                                    Write-Alert 'WARN' "Universe $universe source hijack: primary $($universeTable[$universe].PrimarySource) silent $([int]$primarySilent)s, ${srcIp} is now sending"
+                                    $universeTable[$universe].HijackWarned = $true
+                                }
+                            }
+                        }
 
                         # Duplicate source warning
                         if ($warnDuplicate -and
@@ -666,6 +818,7 @@ try {
 
         # Always check timeouts (even when no packets arrive)
         Invoke-TimeoutCheck
+        Write-UniverseStatus
 
         # Periodic status summary
         if (([DateTime]::Now - $lastStatusTime).TotalSeconds -ge $statusInterval) {
@@ -683,6 +836,7 @@ try {
 
     $exitCode = if ($null -ne $proc -and $proc.HasExited) { $proc.ExitCode } else { "N/A" }
     Write-StatusSummary
+    Write-UniverseStatus
     Write-Alert "INFO" "Monitor stopped. Packets:$packetCount  tshark exit:$exitCode"
     Send-SessionSummaryEmail
     Write-Host "Monitor stopped." -ForegroundColor Gray
