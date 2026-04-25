@@ -1,0 +1,42 @@
+services:
+
+  # --- Grafana (visualization dashboard) ---
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: av-grafana
+  #   ports:
+  #     - "3000:3000"
+  #   volumes:
+  #     - grafana-data:/var/lib/grafana
+  #     - C:\AV-Monitoring\logs:/data/logs:ro
+  #   restart: unless-stopped
+
+  # --- InfluxDB (time-series metrics store) ---
+  # influxdb:
+  #   image: influxdb:2
+  #   container_name: av-influxdb
+  #   ports:
+  #     - "8086:8086"
+  #   volumes:
+  #     - influxdb-data:/var/lib/influxdb2
+  #   restart: unless-stopped
+
+  # --- Alert Service (placeholder — logic not yet implemented) ---
+  # alert-service:
+  #   image: placeholder
+  #   container_name: av-alert-service
+  #   volumes:
+  #     - C:\AV-Monitoring\logs:/data/logs
+  #     - C:\AV-Monitoring\captures:/data/captures:ro
+  #   restart: unless-stopped
+  #   # TODO: define alert logic, thresholds, and Marceline integration
+
+# volumes:
+#   grafana-data:
+#   influxdb-data:
+
+# Notes:
+# - All services are commented out pending Docker Desktop installation and approval
+# - Mount paths use Windows host paths: C:\AV-Monitoring\logs and C:\AV-Monitoring\captures
+# - Capture itself is NOT done in containers — only supporting services live here
+# - Run with: docker compose up -d  (from this directory)

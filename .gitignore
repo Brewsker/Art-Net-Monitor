@@ -1,0 +1,13 @@
+# Credentials - never commit
+docs/credentials.txt
+
+# Runtime data files generated on RADIO PC (not source)
+ip_history.json
+config.json
+
+# Logs
+logs/
+*.log
+
+# Captures
+captures/
