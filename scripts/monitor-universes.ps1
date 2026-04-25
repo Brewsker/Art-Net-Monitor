@@ -52,6 +52,11 @@ $rateWarnHz       = 44   # Art-Net spec max pkt/s per universe (node buffer faul
 $detectSACN       = $true  # warn if sACN appears for a monitored universe (eNode auto-switches)
 $detectARPConflict = $true  # warn on ARP IP-MAC changes (node IP conflict = network blackout)
 $warnArtCommand   = $true  # warn on ArtAddress/ArtInput packets that reconfigure node ports
+$logMaxSizeMB     = 5      # max alerts.log size in MB before rotation
+$logKeepCount     = 3      # number of rotated log files to keep
+$capturesDir      = "C:\AV-Monitoring\captures"  # directory for .pcap alert captures
+$captureOnAlert   = $false # trigger a background tshark .pcap capture on each ALERT
+$captureDurationSecs = 5   # duration of each triggered .pcap capture in seconds
 
 # ---------------------------------------------------------------------------
 # Load config.json (single pass - monitoring + email settings)
@@ -62,6 +67,7 @@ if (Test-Path $ConfigPath) {
         if ($cfg.paths.tshark)                               { $tsharkPath       = $cfg.paths.tshark }
         if ($cfg.paths.alerts_log)                           { $alertsLog        = $cfg.paths.alerts_log }
         if ($cfg.paths.logs)                                 { $logsDir          = $cfg.paths.logs }
+        if ($cfg.paths.captures)                             { $capturesDir      = $cfg.paths.captures }
         if ($cfg.capture.interface_id)                       { $captureInterface = [int]$cfg.capture.interface_id }
         if ($cfg.capture.filter)                             { $captureFilter    = $cfg.capture.filter }
         if ($cfg.monitoring.timeout_seconds)                 { $timeoutSecs      = [int]$cfg.monitoring.timeout_seconds }
@@ -73,6 +79,10 @@ if (Test-Path $ConfigPath) {
         if ($null -ne $cfg.monitoring.detect_sacn)           { $detectSACN       = [bool]$cfg.monitoring.detect_sacn }
         if ($null -ne $cfg.monitoring.detect_arp_conflict)   { $detectARPConflict = [bool]$cfg.monitoring.detect_arp_conflict }
         if ($null -ne $cfg.monitoring.warn_art_command)      { $warnArtCommand   = [bool]$cfg.monitoring.warn_art_command }
+        if ($cfg.logging.max_size_mb)                        { $logMaxSizeMB     = [int]$cfg.logging.max_size_mb }
+        if ($cfg.logging.keep_count)                         { $logKeepCount     = [int]$cfg.logging.keep_count }
+        if ($null -ne $cfg.logging.capture_on_alert)         { $captureOnAlert   = [bool]$cfg.logging.capture_on_alert }
+        if ($cfg.logging.capture_duration_seconds)           { $captureDurationSecs = [int]$cfg.logging.capture_duration_seconds }
     } catch {
         Write-Warning "Could not fully load $ConfigPath : $_  -- Using defaults."
     }
@@ -182,6 +192,26 @@ function Write-Alert {
     Write-Host $entry -ForegroundColor $color
     Add-Content -Path $alertsLog -Value $entry
     Send-AlertEmail -Type $Type -Message $Message
+}
+
+# ---------------------------------------------------------------------------
+# Log rotation: called once at startup before first write
+# ---------------------------------------------------------------------------
+function Rotate-AlertsLog {
+    if (-not (Test-Path $alertsLog)) { return }
+    $sizeBytes = (Get-Item $alertsLog).Length
+    if ($sizeBytes -lt ($logMaxSizeMB * 1MB)) { return }
+    $logDir  = Split-Path $alertsLog -Parent
+    $logLeaf = Split-Path $alertsLog -Leaf
+    # Shift existing rotated files up; delete oldest when it exceeds keep_count
+    for ($i = ($logKeepCount - 1); $i -ge 1; $i--) {
+        $src = Join-Path $logDir "$logLeaf.$i"
+        $dst = Join-Path $logDir "$logLeaf.$($i + 1)"
+        if (Test-Path $dst) { Remove-Item $dst -Force }
+        if (Test-Path $src) { Rename-Item -Path $src -NewName "$logLeaf.$($i + 1)" -Force }
+    }
+    Rename-Item -Path $alertsLog -NewName "$logLeaf.1" -Force
+    Write-Host "[INFO] alerts.log rotated ($([math]::Round($sizeBytes / 1MB, 1)) MB exceeded ${logMaxSizeMB}MB threshold)" -ForegroundColor DarkCyan
 }
 
 # ---------------------------------------------------------------------------
@@ -360,10 +390,11 @@ Write-Host "Expected unis : $($expectedUnis -join ', ')" -ForegroundColor Gray
 Write-Host "Grace period  : ${startupGrace}s" -ForegroundColor Gray
 Write-Host "Alerts log    : $alertsLog" -ForegroundColor Gray
 Write-Host "Fault detection: rate>${rateWarnHz}Hz | sACN=$(if($detectSACN){'on'}else{'off'}) | ARP=$(if($detectARPConflict){'on'}else{'off'}) | ArtCmd=$(if($warnArtCommand){'on'}else{'off'})" -ForegroundColor DarkGray
+Write-Host "Log rotation    : max=${logMaxSizeMB}MB keep=${logKeepCount} | Alert capture: $(if($captureOnAlert){'on ('+$captureDurationSecs+'s)'}else{'off'})" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Events will appear below. Press Ctrl+C to stop." -ForegroundColor Yellow
 Write-Host ""
-
+Rotate-AlertsLog
 Write-Alert "INFO" "Monitor started - interface:$captureInterface  universes:$($expectedUnis -join ',')  timeout:${timeoutSecs}s"
 
 # ---------------------------------------------------------------------------
