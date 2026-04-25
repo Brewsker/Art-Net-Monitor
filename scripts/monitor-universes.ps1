@@ -192,6 +192,73 @@ function Write-Alert {
     Write-Host $entry -ForegroundColor $color
     Add-Content -Path $alertsLog -Value $entry
     Send-AlertEmail -Type $Type -Message $Message
+    if ($Type -eq 'ALERT')    { $script:sessionAlertCount++ }
+    if ($Type -eq 'RECOVERY') { $script:sessionRecoveryCount++ }
+}
+
+# ---------------------------------------------------------------------------
+# Session summary email (sent once on clean exit via finally)
+# ---------------------------------------------------------------------------
+function Send-SessionSummaryEmail {
+    if (-not $emailEnabled)                    { return }
+    if (-not $emailFrom -or -not $emailTo)     { return }
+    $sendPass = ''
+    try {
+        $sendCfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        if ($sendCfg.email.app_password) { $sendPass = $sendCfg.email.app_password }
+    } catch {}
+    if (-not $sendPass -or $sendPass -match '^xxxx') { return }
+    $now       = [DateTime]::Now
+    $uptime    = [int]($now - $monitorStart).TotalSeconds
+    $uptimeStr = '{0:D2}h {1:D2}m {2:D2}s' -f [int]($uptime / 3600), [int](($uptime % 3600) / 60), ($uptime % 60)
+    $neverSeen = @($expectedUnis | Where-Object {
+        -not $universeTable.ContainsKey([int]$_) -or -not $universeTable[[int]$_].EverSeen
+    })
+    $rateOverloads = @($universeTable.Keys | Where-Object { $universeTable[$_].RateAlerted })
+    $sacnConflicts = @($sacnWarnTimes.Keys)
+    $lines = @(
+        '=== Art-Net Monitor Session Summary ===',
+        "Host      : $(hostname)",
+        "Uptime    : $uptimeStr",
+        "Packets   : $packetCount",
+        '',
+        "Alerts    : $($script:sessionAlertCount)",
+        "Recoveries: $($script:sessionRecoveryCount)",
+        ''
+    )
+    if ($neverSeen.Count -gt 0) {
+        $lines += "Universes never seen : $($neverSeen -join ', ')"
+    } else {
+        $lines += 'All expected universes were seen.'
+    }
+    if ($rateOverloads.Count -gt 0) { $lines += "Rate overload (U)    : $($rateOverloads -join ', ')" }
+    if ($sacnConflicts.Count  -gt 0) { $lines += "sACN conflicts (U)   : $($sacnConflicts  -join ', ')" }
+    try {
+        $subject = "[Art-Net Monitor] Session Summary - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+        $body    = $lines -join "`r`n"
+        $smtp3   = New-Object System.Net.Mail.SmtpClient($smtpServer, $smtpPort)
+        $smtp3.EnableSsl             = $smtpUseSSL
+        $smtp3.DeliveryMethod        = [System.Net.Mail.SmtpDeliveryMethod]::Network
+        $smtp3.UseDefaultCredentials = $false
+        $smtp3.Credentials           = New-Object System.Net.NetworkCredential($emailFrom, $sendPass)
+        $msg3         = New-Object System.Net.Mail.MailMessage
+        $msg3.From    = $emailFrom
+        $msg3.To.Add($emailTo)
+        $msg3.Subject = $subject
+        $msg3.Body    = $body
+        $smtp3.Send($msg3)
+        $msg3.Dispose()
+        $smtp3.Dispose()
+        $logTs = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[INFO] [$logTs] Session summary email sent -> $emailTo"
+    } catch {
+        $sumErr = $_.Exception.Message
+        $logTs  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] Session summary email failed: $sumErr"
+    } finally {
+        $sendPass = $null
+        Remove-Variable sendPass -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -240,6 +307,8 @@ $universeTable  = @{}
 $monitorStart   = [DateTime]::Now
 $lastStatusTime = [DateTime]::Now
 $packetCount    = 0
+$script:sessionAlertCount    = 0
+$script:sessionRecoveryCount = 0
 
 function Initialize-Universe([int]$uni) {
     if (-not $universeTable.ContainsKey($uni)) {
@@ -582,6 +651,7 @@ try {
     $exitCode = if ($null -ne $proc -and $proc.HasExited) { $proc.ExitCode } else { "N/A" }
     Write-StatusSummary
     Write-Alert "INFO" "Monitor stopped. Packets:$packetCount  tshark exit:$exitCode"
+    Send-SessionSummaryEmail
     Write-Host "Monitor stopped." -ForegroundColor Gray
     Write-Host ""
     Read-Host "Press Enter to close"
