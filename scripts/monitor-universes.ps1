@@ -174,12 +174,12 @@ function Send-AlertEmail {
         $msg2.Dispose()
         $smtp2.Dispose()
         $ts2 = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        Add-Content -Path $alertsLog -Value "[INFO] [$ts2] Email sent OK: $subject -> $emailTo"
+        Append-AlertLog "[INFO] [$ts2] Email sent OK: $subject -> $emailTo"
     } catch {
         $errMsg2 = $_.Exception.Message
         Write-Host "[WARN] Email send failed: $errMsg2" -ForegroundColor Yellow
         $ts2 = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        Add-Content -Path $alertsLog -Value "[WARN] [$ts2] Email send failed: $errMsg2"
+        Append-AlertLog "[WARN] [$ts2] Email send failed: $errMsg2"
     } finally {
         $sendPass = $null
         Remove-Variable sendPass -ErrorAction SilentlyContinue
@@ -207,6 +207,20 @@ if ($captureInterfaces.Count -eq 0 -or ($captureInterfaces.Count -eq 1 -and $cap
 if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir | Out-Null }
 
 # ---------------------------------------------------------------------------
+# Alert log append helper — uses FileShare::ReadWrite so the GUI can read
+# the file simultaneously without locking conflicts.
+# ---------------------------------------------------------------------------
+function Append-AlertLog {
+    param([string]$Entry)
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("$Entry`r`n")
+        $fs    = [System.IO.File]::Open($alertsLog, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Close()
+    } catch {}
+}
+
+# ---------------------------------------------------------------------------
 # Alert writer
 # ---------------------------------------------------------------------------
 function Write-Alert {
@@ -221,7 +235,7 @@ function Write-Alert {
         default    { "White" }
     }
     Write-Host $entry -ForegroundColor $color
-    Add-Content -Path $alertsLog -Value $entry
+    Append-AlertLog $entry
     # Check alert suppression window — still write to log, but skip email when suppressed
     $script:emailSuppressed = $false
     if ($suppressStart -and $suppressEnd) {
@@ -281,7 +295,7 @@ function Send-NtfyNotification {
     } catch {
         $ntfyErr = $_.Exception.Message
         $logTs   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] ntfy send failed: $ntfyErr"
+        Append-AlertLog "[WARN] [$logTs] ntfy send failed: $ntfyErr"
     }
 }
 
@@ -334,11 +348,11 @@ function Start-AlertCapture {
         $capPsi.CreateNoWindow         = $true
         [void][System.Diagnostics.Process]::Start($capPsi)
         $logTs = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        Add-Content -Path $alertsLog -Value "[INFO] [$logTs] .pcap capture started: $pcapFile (${captureDurationSecs}s)"
+        Append-AlertLog "[INFO] [$logTs] .pcap capture started: $pcapFile (${captureDurationSecs}s)"
     } catch {
         $capErr = $_.Exception.Message
         $logTs  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] .pcap capture failed to start: $capErr"
+        Append-AlertLog "[WARN] [$logTs] .pcap capture failed to start: $capErr"
     }
 }
 
@@ -396,11 +410,11 @@ function Send-SessionSummaryEmail {
         $msg3.Dispose()
         $smtp3.Dispose()
         $logTs = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        Add-Content -Path $alertsLog -Value "[INFO] [$logTs] Session summary email sent -> $emailTo"
+        Append-AlertLog "[INFO] [$logTs] Session summary email sent -> $emailTo"
     } catch {
         $sumErr = $_.Exception.Message
         $logTs  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] Session summary email failed: $sumErr"
+        Append-AlertLog "[WARN] [$logTs] Session summary email failed: $sumErr"
     } finally {
         $sendPass = $null
         Remove-Variable sendPass -ErrorAction SilentlyContinue
@@ -765,7 +779,7 @@ try {
                     # ----------------------------------------------------------
                     if ($warnArtCommand) {
                         $opCode = Get-ArtNetOpCode $hexPay
-                        $ignoredOps = @(0x5000, 0x2100, 0x2110, 0x9100, 0x9200, 0xA800, 0x0200)
+                        $ignoredOps = @(0x5000, 0x2100, 0x2110, 0x9100, 0x9200, 0xA800, 0x0200, 0x0000)
                         if ($null -ne $opCode -and $opCode -notin $ignoredOps) {
                             $opName = switch ($opCode) {
                                 0x6000 { 'ArtAddress (node reconfiguration - can change port direction or put port to standby!)' }
