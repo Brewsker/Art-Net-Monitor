@@ -65,6 +65,11 @@ $logKeepCount     = 3      # number of rotated log files to keep
 $capturesDir      = "C:\AV-Monitoring\captures"  # directory for .pcap alert captures
 $captureOnAlert   = $false # trigger a background tshark .pcap capture on each ALERT
 $captureDurationSecs = 5   # duration of each triggered .pcap capture in seconds
+$ntfyEnabled      = $false # send push notification via ntfy.sh on each alert
+$ntfyTopic        = ""     # ntfy topic name (e.g. "my-artnet-monitor")
+$ntfyServer       = "https://ntfy.sh"  # ntfy server (can be self-hosted)
+$audioEnabled     = $false # play audio alert on ALERT events
+$audioFile        = ""     # path to .wav file; empty = use Beep()
 
 # ---------------------------------------------------------------------------
 # Load config.json (single pass - monitoring + email settings)
@@ -96,6 +101,11 @@ if (Test-Path $ConfigPath) {
         if ($cfg.logging.keep_count)                         { $logKeepCount     = [int]$cfg.logging.keep_count }
         if ($null -ne $cfg.logging.capture_on_alert)         { $captureOnAlert   = [bool]$cfg.logging.capture_on_alert }
         if ($cfg.logging.capture_duration_seconds)           { $captureDurationSecs = [int]$cfg.logging.capture_duration_seconds }
+        if ($null -ne $cfg.alerts.ntfy_enabled)              { $ntfyEnabled   = [bool]$cfg.alerts.ntfy_enabled }
+        if ($cfg.alerts.ntfy_topic)                          { $ntfyTopic     = $cfg.alerts.ntfy_topic }
+        if ($cfg.alerts.ntfy_server)                         { $ntfyServer    = $cfg.alerts.ntfy_server }
+        if ($null -ne $cfg.alerts.audio_enabled)             { $audioEnabled  = [bool]$cfg.alerts.audio_enabled }
+        if ($cfg.alerts.audio_file)                          { $audioFile     = $cfg.alerts.audio_file }
         if ($cfg.monitoring.suppress_start) { $suppressStart = $cfg.monitoring.suppress_start }
         if ($cfg.monitoring.suppress_end)   { $suppressEnd   = $cfg.monitoring.suppress_end }
     } catch {
@@ -231,8 +241,72 @@ function Write-Alert {
         }
     }
     if (-not $script:emailSuppressed) { Send-AlertEmail -Type $Type -Message $Message }
-    if ($Type -eq 'ALERT')    { $script:sessionAlertCount++; Start-AlertCapture -AlertMessage $Message }
-    if ($Type -eq 'RECOVERY') { $script:sessionRecoveryCount++ }
+    if (-not $script:emailSuppressed) { Send-NtfyNotification -Type $Type -Message $Message }
+    if ($Type -eq 'ALERT') {
+        if (-not $script:emailSuppressed) { Invoke-AudioAlert -IsRecovery $false }
+        $script:sessionAlertCount++
+        Start-AlertCapture -AlertMessage $Message
+    }
+    if ($Type -eq 'RECOVERY') {
+        if (-not $script:emailSuppressed) { Invoke-AudioAlert -IsRecovery $true }
+        $script:sessionRecoveryCount++
+    }
+}
+
+# ---------------------------------------------------------------------------
+# ntfy.sh push notification (fire-and-forget, non-blocking via job)
+# ---------------------------------------------------------------------------
+function Send-NtfyNotification {
+    param([string]$Type, [string]$Message)
+    if (-not $ntfyEnabled -or -not $ntfyTopic) { return }
+    $priority = switch ($Type) {
+        'ALERT'    { 'urgent' }
+        'WARN'     { 'default' }
+        'RECOVERY' { 'low' }
+        default    { 'default' }
+    }
+    $tags = switch ($Type) {
+        'ALERT'    { 'warning,rotating_light' }
+        'RECOVERY' { 'white_check_mark' }
+        default    { 'information_source' }
+    }
+    $url = "$($ntfyServer.TrimEnd('/'))/$ntfyTopic"
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add('Title',    "Art-Net $Type on $(hostname)")
+        $wc.Headers.Add('Priority', $priority)
+        $wc.Headers.Add('Tags',     $tags)
+        [void]$wc.UploadString($url, $Message)
+        $wc.Dispose()
+    } catch {
+        $ntfyErr = $_.Exception.Message
+        $logTs   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] ntfy send failed: $ntfyErr"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Local audio alert
+# ALERT: high tone (or alert.wav); RECOVERY: low tone (or recovery.wav)
+# Suppressed during the alert suppression window (same flag as email)
+# ---------------------------------------------------------------------------
+function Invoke-AudioAlert {
+    param([bool]$IsRecovery)
+    if (-not $audioEnabled) { return }
+    if ($audioFile -and (Test-Path $audioFile)) {
+        try {
+            $player = New-Object System.Media.SoundPlayer($audioFile)
+            $player.Play()  # async, non-blocking
+        } catch {}
+    } else {
+        if ($IsRecovery) {
+            [console]::Beep(440, 200)
+        } else {
+            [console]::Beep(880, 300)
+            Start-Sleep -Milliseconds 100
+            [console]::Beep(880, 300)
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
