@@ -26,6 +26,7 @@ $ScriptsPath = "C:\AV-Monitoring\scripts"
 $AlertsLog      = "C:\AV-Monitoring\logs\alerts.log"
 $IPHistoryPath  = "C:\AV-Monitoring\ip_history.json"
 $GenControlFile = "C:\AV-Monitoring\generator-control.json"
+$StatusJsonPath = "C:\AV-Monitoring\logs\universe-status.json"
 
 # ---------------------------------------------------------------------------
 # Script-level state
@@ -49,6 +50,8 @@ function Load-Config {
 function Save-Config {
     param(
         [int]$InterfaceId, [int[]]$Universes, [int]$Timeout, [int]$Grace,
+        # Alert suppression
+        [string]$SuppressStart = '', [string]$SuppressEnd = '',
         # Email params
         [bool]$EmailEnabled, [string]$SmtpServer, [int]$SmtpPort, [bool]$UseSSL,
         [string]$FromAddr, [string]$AppPass, [string]$ToAddr,
@@ -87,6 +90,8 @@ function Save-Config {
             startup_grace_seconds = $Grace
             duplicate_source_warn = $true
             check_interval_ms     = 500
+            suppress_start        = $SuppressStart
+            suppress_end          = $SuppressEnd
         }
         email     = $emailObj
         generator = $genObj
@@ -224,7 +229,7 @@ function New-GB {
 # ===========================================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = "Art-Net Monitor - Control Panel"
-$form.ClientSize      = [System.Drawing.Size]::new(700, 1010)
+$form.ClientSize      = [System.Drawing.Size]::new(700, 1270)
 $form.FormBorderStyle = "Sizable"
 $form.MaximizeBox     = $true
 $form.StartPosition   = "CenterScreen"
@@ -235,7 +240,7 @@ $form.MinimumSize     = [System.Drawing.Size]::new(500, 400)
 # ===========================================================================
 # 1. CONFIGURATION  (y=8, h=152)
 # ===========================================================================
-$gbCfg = New-GB "Configuration" 8 8 684 152
+$gbCfg = New-GB "Configuration" 8 8 684 182
 $form.Controls.Add($gbCfg)
 
 $gbCfg.Controls.Add((New-Lbl "Interface:" 10 26 78))
@@ -280,10 +285,23 @@ $lblCfgMsg = New-Lbl "" 140 120 455 20
 $lblCfgMsg.ForeColor = [System.Drawing.Color]::FromArgb(100, 200, 100)
 $gbCfg.Controls.Add($lblCfgMsg)
 
+# Alert suppression schedule row
+$gbCfg.Controls.Add((New-Lbl "Suppress alerts:" 10 152 100 20))
+$txtSuppressFrom = New-Txt 113 149 60 ""
+$txtSuppressFrom.MaxLength = 5
+$gbCfg.Controls.Add($txtSuppressFrom)
+$gbCfg.Controls.Add((New-Lbl "to" 177 152 20))
+$txtSuppressTo = New-Txt 199 149 60 ""
+$txtSuppressTo.MaxLength = 5
+$gbCfg.Controls.Add($txtSuppressTo)
+$lblSuppHint = New-Lbl "(24h HH:mm — blank=disabled; emails only, still logs to file)" 265 152 400 20
+$lblSuppHint.ForeColor = [System.Drawing.Color]::FromArgb(85,85,85)
+$gbCfg.Controls.Add($lblSuppHint)
+
 # ===========================================================================
-# 2. UNIVERSE MONITOR  (left, y=170, w=295, h=148)
+# 2. UNIVERSE MONITOR  (y=200, h=100)
 # ===========================================================================
-$gbMon = New-GB "Universe Monitor" 8 170 684 100
+$gbMon = New-GB "Universe Monitor" 8 200 684 100
 $form.Controls.Add($gbMon)
 
 $lblMonStat = New-Object System.Windows.Forms.Label
@@ -310,9 +328,31 @@ $lblMonNote.ForeColor = [System.Drawing.Color]::FromArgb(75, 75, 75)
 $gbMon.Controls.Add($lblMonNote)
 
 # ===========================================================================
-# 3. ART-NET GENERATOR  (y=170, full width, h=330)
+# 2b. UNIVERSE HEALTH GRID  (y=310, h=220)
 # ===========================================================================
-$gbGen = New-GB "Art-Net Generator (Test)" 8 280 684 330
+$gbGrid = New-GB "Universe Health" 8 310 684 220
+$form.Controls.Add($gbGrid)
+
+# Tile colors: OK=dark green, DROPPED=dark red, OVERLOAD=dark amber, NEVER_SEEN=dark gray
+$GridClrOK      = [System.Drawing.Color]::FromArgb(0,   100, 40)
+$GridClrDropped = [System.Drawing.Color]::FromArgb(140,  30, 30)
+$GridClrOverload= [System.Drawing.Color]::FromArgb(130,  90,  0)
+$GridClrNever   = [System.Drawing.Color]::FromArgb( 52,  52, 52)
+
+$pnlGrid = New-Object System.Windows.Forms.Panel
+$pnlGrid.Location    = [System.Drawing.Point]::new(8, 22)
+$pnlGrid.Size        = [System.Drawing.Size]::new(664, 182)
+$pnlGrid.AutoScroll  = $true
+$pnlGrid.BackColor   = [System.Drawing.Color]::FromArgb(22, 22, 22)
+$pnlGrid.BorderStyle = "FixedSingle"
+$gbGrid.Controls.Add($pnlGrid)
+
+$script:healthTiles = [System.Collections.Generic.Dictionary[int, System.Windows.Forms.Label]]::new()
+
+# ===========================================================================
+# 3. ART-NET GENERATOR  (y=540, full width, h=330)
+# ===========================================================================
+$gbGen = New-GB "Art-Net Generator (Test)" 8 540 684 330
 $form.Controls.Add($gbGen)
 
 # --- Row 1: Source IP, Dest IP
@@ -413,9 +453,9 @@ $lblGenStatus.ForeColor = $TxtGray
 $gbGen.Controls.Add($lblGenStatus)
 
 # ===========================================================================
-# 4. EMAIL ALERTS  (y=510, h=120)
+# 4. EMAIL ALERTS  (y=880, h=118)
 # ===========================================================================
-$gbEmail = New-GB "Email Alerts (Gmail)" 8 620 684 118
+$gbEmail = New-GB "Email Alerts (Gmail)" 8 880 684 118
 $form.Controls.Add($gbEmail)
 
 $chkEmailEn = New-Object System.Windows.Forms.CheckBox
@@ -451,9 +491,9 @@ $lblEmailMsg.ForeColor = [System.Drawing.Color]::FromArgb(100,200,100)
 $gbEmail.Controls.Add($lblEmailMsg)
 
 # ===========================================================================
-# 5. ALERTS LOG  (y=638, h=230)
+# 5. ALERTS LOG  (y=1008, h=230)
 # ===========================================================================
-$gbLog = New-GB "Alerts Log" 8 748 684 230
+$gbLog = New-GB "Alerts Log" 8 1008 684 230
 $form.Controls.Add($gbLog)
 
 $rtbLog = New-Object System.Windows.Forms.RichTextBox
@@ -556,6 +596,77 @@ function Write-AlertLog {
     Refresh-Log
 }
 
+# ---------------------------------------------------------------------------
+# Health grid — build tiles from expected universe list, refresh from JSON
+# ---------------------------------------------------------------------------
+function Build-HealthGrid {
+    foreach ($lbl in $script:healthTiles.Values) { try { $lbl.Dispose() } catch {} }
+    $pnlGrid.Controls.Clear()
+    $script:healthTiles.Clear()
+    $unis = @()
+    try {
+        $unis = @($txtUnis.Text -split '[,\s]+' | Where-Object { $_ -ne '' } |
+                  ForEach-Object { [int]$_ } | Sort-Object -Unique)
+    } catch {}
+    if ($unis.Count -eq 0) { return }
+    $tileW = 72; $tileH = 52; $cols = 9; $pad = 4
+    $col = 0; $row = 0
+    foreach ($uni in $unis) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text        = "U$uni`nNONE`n- Hz"
+        $lbl.Location    = [System.Drawing.Point]::new($col * ($tileW + $pad) + $pad, $row * ($tileH + $pad) + $pad)
+        $lbl.Size        = [System.Drawing.Size]::new($tileW, $tileH)
+        $lbl.TextAlign   = [System.Drawing.ContentAlignment]::MiddleCenter
+        $lbl.Font        = New-Object System.Drawing.Font("Consolas", 7.5)
+        $lbl.ForeColor   = [System.Drawing.Color]::FromArgb(200, 200, 200)
+        $lbl.BackColor   = $GridClrNever
+        $lbl.BorderStyle = "FixedSingle"
+        $pnlGrid.Controls.Add($lbl)
+        $script:healthTiles[$uni] = $lbl
+        $col++
+        if ($col -ge $cols) { $col = 0; $row++ }
+    }
+}
+
+function Refresh-HealthGrid {
+    if (-not (Test-Path $StatusJsonPath)) { return }
+    $status = $null
+    try { $status = Get-Content $StatusJsonPath -Raw | ConvertFrom-Json } catch { return }
+    if (-not $status -or -not $status.universes) { return }
+    foreach ($kv in $script:healthTiles.GetEnumerator()) {
+        $uni  = $kv.Key
+        $lbl  = $kv.Value
+        $uKey = "$uni"
+        $uProp = $status.universes.PSObject.Properties | Where-Object { $_.Name -eq $uKey }
+        if (-not $uProp) {
+            $lbl.BackColor = $GridClrNever
+            $lbl.Text      = "U$uni`nNONE`n- Hz"
+            continue
+        }
+        $u     = $uProp.Value
+        $state = $u.state
+        $hz    = [int]$u.hz
+        $lbl.BackColor = switch ($state) {
+            'OK'         { $GridClrOK }
+            'DROPPED'    { $GridClrDropped }
+            'OVERLOAD'   { $GridClrOverload }
+            default      { $GridClrNever }
+        }
+        $stateShort = switch ($state) {
+            'OK'         { 'OK' }
+            'DROPPED'    { 'DROP' }
+            'OVERLOAD'   { 'OVLD' }
+            default      { 'NONE' }
+        }
+        $lbl.Text = "U$uni`n$stateShort`n${hz} Hz"
+    }
+}
+
+function Update-Status {
+    } catch {}
+    Refresh-Log
+}
+
 function Update-Status {
     if ($script:monitorProc -and -not $script:monitorProc.HasExited) {
         $lblMonStat.Text      = "  Running"
@@ -616,6 +727,8 @@ function Apply-ConfigToUI {
     if ($m.expected_universes)            { $txtUnis.Text = ($m.expected_universes -join ", ") }
     if ($m.timeout_seconds)               { $numTimeout.Value = [Math]::Max(1,[Math]::Min(120,[int]$m.timeout_seconds)) }
     if ($null -ne $m.startup_grace_seconds) { $numGrace.Value = [Math]::Max(0,[Math]::Min(120,[int]$m.startup_grace_seconds)) }
+    if ($m.suppress_start) { $txtSuppressFrom.Text = $m.suppress_start }
+    if ($m.suppress_end)   { $txtSuppressTo.Text   = $m.suppress_end }
     if ($g) {
         # Don't set source/dest IP from config - history (Load-IPHistory) handles recall
         if ($g.universe_count)     { $numGenCount.Value = [Math]::Max(1,[Math]::Min(512,[int]$g.universe_count)) }
@@ -782,6 +895,7 @@ $btnSaveCfg.Add_Click({
     $enabledUnis = @($script:uniCheckboxes | Where-Object { $_.Checked } | ForEach-Object { [int]$_.Tag })
     Save-Config -InterfaceId $ifaceId -Universes $unis `
                 -Timeout ([int]$numTimeout.Value) -Grace ([int]$numGrace.Value) `
+                -SuppressStart $txtSuppressFrom.Text.Trim() -SuppressEnd $txtSuppressTo.Text.Trim() `
                 -EmailEnabled $chkEmailEn.Checked `
                 -SmtpServer "smtp.gmail.com" -SmtpPort 587 -UseSSL $true `
                 -FromAddr $txtEmailFrom.Text.Trim() `
@@ -794,6 +908,7 @@ $btnSaveCfg.Add_Click({
     $stripLbl.Text  = "Config saved to $ConfigPath"
     Update-IPHistory -SrcIP $txtSrcIP.Text.Trim() -DstIP $txtDstIP.Text.Trim() `
                      -EmailFrom $txtEmailFrom.Text.Trim() -EmailTo $txtEmailTo.Text.Trim()
+    Build-HealthGrid    # rebuild tiles if universe list changed
 })
 
 $btnStartMon.Add_Click({
@@ -999,7 +1114,7 @@ $txtEmailFrom.Add_SelectedIndexChanged({
     }
 })
 
-$timerLog.Add_Tick({ Refresh-Log })
+$timerLog.Add_Tick({ Refresh-Log; Refresh-HealthGrid })
 $timerStatus.Add_Tick({ Update-Status })
 
 $form.Add_FormClosing({
@@ -1045,6 +1160,8 @@ $form.Add_FormClosing({
     }
     foreach ($cb in $script:uniCheckboxes) { try { $cb.Dispose() } catch {} }
     $script:uniCheckboxes.Clear()
+    foreach ($lbl in $script:healthTiles.Values) { try { $lbl.Dispose() } catch {} }
+    $script:healthTiles.Clear()
 })
 
 # ===========================================================================
@@ -1054,6 +1171,8 @@ $form.Add_Load({
     Apply-ConfigToUI
     Populate-Interfaces
     Build-UniverseGrid
+    Build-HealthGrid
+    Refresh-HealthGrid
     # Start offset at end of existing log so old entries are not shown on launch
     if (Test-Path $AlertsLog) {
         try { $script:logLineOffset = @(Get-Content $AlertsLog -ErrorAction Stop).Count } catch {}
