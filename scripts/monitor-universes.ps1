@@ -192,8 +192,41 @@ function Write-Alert {
     Write-Host $entry -ForegroundColor $color
     Add-Content -Path $alertsLog -Value $entry
     Send-AlertEmail -Type $Type -Message $Message
-    if ($Type -eq 'ALERT')    { $script:sessionAlertCount++ }
+    if ($Type -eq 'ALERT')    { $script:sessionAlertCount++; Start-AlertCapture -AlertMessage $Message }
     if ($Type -eq 'RECOVERY') { $script:sessionRecoveryCount++ }
+}
+
+# ---------------------------------------------------------------------------
+# Triggered .pcap capture on ALERT (background process, non-blocking)
+# Filename: alert_U{universe}_{timestamp}.pcap saved to captures dir
+# ---------------------------------------------------------------------------
+function Start-AlertCapture {
+    param([string]$AlertMessage)
+    if (-not $captureOnAlert) { return }
+    if (-not (Test-Path $capturesDir)) {
+        try { New-Item -ItemType Directory -Path $capturesDir -Force | Out-Null } catch { return }
+    }
+    # Extract universe number from alert message text if present
+    $uniTag = ''
+    if ($AlertMessage -match 'Universe (\d+)') { $uniTag = "_U$($Matches[1])" }
+    $ts2      = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $pcapFile = Join-Path $capturesDir "alert${uniTag}_${ts2}.pcap"
+    try {
+        $capPsi                        = New-Object System.Diagnostics.ProcessStartInfo
+        $capPsi.FileName               = $tsharkPath
+        $capPsi.Arguments              = "-i $captureInterface -f `"udp port 6454`" -a duration:$captureDurationSecs -w `"$pcapFile`""
+        $capPsi.RedirectStandardOutput = $false
+        $capPsi.RedirectStandardError  = $false
+        $capPsi.UseShellExecute        = $false
+        $capPsi.CreateNoWindow         = $true
+        [void][System.Diagnostics.Process]::Start($capPsi)
+        $logTs = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[INFO] [$logTs] .pcap capture started: $pcapFile (${captureDurationSecs}s)"
+    } catch {
+        $capErr = $_.Exception.Message
+        $logTs  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Add-Content -Path $alertsLog -Value "[WARN] [$logTs] .pcap capture failed to start: $capErr"
+    }
 }
 
 # ---------------------------------------------------------------------------
