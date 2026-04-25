@@ -60,7 +60,9 @@ function Save-Config {
         [bool]$AudioEnabled, [string]$AudioFile,
         # Generator params
         [string]$GenDestIP, [string]$GenSrcIP,
-        [int]$GenCount, [int]$GenStart, [int]$GenPPS, [int[]]$GenEnabled
+        [int]$GenCount, [int]$GenStart, [int]$GenPPS, [int[]]$GenEnabled,
+        # F1: channel overrides JSON string
+        [string]$ChannelOverridesJson = '[]'
     )
     # Preserve existing values for sections that the GUI doesn't fully manage
     Load-Config
@@ -95,6 +97,15 @@ function Save-Config {
         start_universe    = if ($GenStart -gt 0) { $GenStart } elseif ($existingGen) { [int]$existingGen.start_universe } else { 1 }
         packets_per_second = if ($GenPPS -gt 0) { $GenPPS } elseif ($existingGen) { [int]$existingGen.packets_per_second } else { 10 }
         enabled_universes = if ($GenEnabled) { $GenEnabled } else { @() }
+        channel_overrides = $(
+            $parsed = $null
+            if ($ChannelOverridesJson -and $ChannelOverridesJson.Trim() -notin @('', '[]')) {
+                try { $parsed = $ChannelOverridesJson | ConvertFrom-Json } catch {}
+            }
+            if ($null -ne $parsed) { @($parsed) }
+            elseif ($existingGen -and $existingGen.channel_overrides) { @($existingGen.channel_overrides) }
+            else { @() }
+        )
     }
     # Preserve logging/watchdog/interface_ids that the GUI doesn't edit
     $loggingObj  = if ($existingLogging) { $existingLogging } else {
@@ -255,7 +266,7 @@ function New-GB {
 # ===========================================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = "Art-Net Monitor - Control Panel"
-$form.ClientSize      = [System.Drawing.Size]::new(700, 1400)
+$form.ClientSize      = [System.Drawing.Size]::new(700, 1540)
 $form.FormBorderStyle = "Sizable"
 $form.MaximizeBox     = $true
 $form.StartPosition   = "CenterScreen"
@@ -378,7 +389,7 @@ $script:healthTiles = [System.Collections.Generic.Dictionary[int, System.Windows
 # ===========================================================================
 # 3. ART-NET GENERATOR  (y=540, full width, h=330)
 # ===========================================================================
-$gbGen = New-GB "Art-Net Generator (Test)" 8 540 684 330
+$gbGen = New-GB "Art-Net Generator (Test)" 8 540 684 470
 $form.Controls.Add($gbGen)
 
 # --- Row 1: Source IP, Dest IP
@@ -478,10 +489,70 @@ $lblGenStatus = New-Lbl "" 330 254 350 20
 $lblGenStatus.ForeColor = $TxtGray
 $gbGen.Controls.Add($lblGenStatus)
 
+# F3: Burst / stress test mode
+$chkBurst = New-Object System.Windows.Forms.CheckBox
+$chkBurst.Text      = "Stress Test Mode (Burst)"
+$chkBurst.Location  = [System.Drawing.Point]::new(8, 286)
+$chkBurst.Size      = [System.Drawing.Size]::new(200, 22)
+$chkBurst.ForeColor = [System.Drawing.Color]::FromArgb(255,120,80)
+$chkBurst.BackColor = [System.Drawing.Color]::Transparent
+$gbGen.Controls.Add($chkBurst)
+
+$gbGen.Controls.Add((New-Lbl "Hz:" 215 288 28))
+$numBurstHz = New-Object System.Windows.Forms.NumericUpDown
+$numBurstHz.Location = [System.Drawing.Point]::new(244, 285)
+$numBurstHz.Size     = [System.Drawing.Size]::new(65, 22)
+$numBurstHz.Minimum  = 10; $numBurstHz.Maximum = 500; $numBurstHz.Value = 100
+$numBurstHz.BackColor = $DarkInput; $numBurstHz.ForeColor = $TxtWhite
+$gbGen.Controls.Add($numBurstHz)
+
+$gbGen.Controls.Add((New-Lbl "Dur (s):" 318 288 54))
+$numBurstDur = New-Object System.Windows.Forms.NumericUpDown
+$numBurstDur.Location = [System.Drawing.Point]::new(374, 285)
+$numBurstDur.Size     = [System.Drawing.Size]::new(65, 22)
+$numBurstDur.Minimum  = 5; $numBurstDur.Maximum = 300; $numBurstDur.Value = 30
+$numBurstDur.BackColor = $DarkInput; $numBurstDur.ForeColor = $TxtWhite
+$gbGen.Controls.Add($numBurstDur)
+
+$lblBurstWarn = New-Lbl "Will trigger overload alerts" 450 290 220 18
+$lblBurstWarn.ForeColor = [System.Drawing.Color]::FromArgb(180,80,40)
+$gbGen.Controls.Add($lblBurstWarn)
+
+# F2: Scene file
+$gbGen.Controls.Add((New-Lbl "Scene File:" 8 318 70))
+$txtSceneFile = New-Txt 80 315 390 ""
+$txtSceneFile.PlaceholderText = "(optional JSON scene file)"
+$gbGen.Controls.Add($txtSceneFile)
+
+$btnBrowseScene = New-Btn "Browse..." 478 314 80 24 $BtnGray
+$gbGen.Controls.Add($btnBrowseScene)
+
+$chkAutoStep = New-Object System.Windows.Forms.CheckBox
+$chkAutoStep.Text      = "Auto-Step"
+$chkAutoStep.Location  = [System.Drawing.Point]::new(566, 316)
+$chkAutoStep.Size      = [System.Drawing.Size]::new(100, 22)
+$chkAutoStep.ForeColor = $TxtWhite
+$chkAutoStep.BackColor = [System.Drawing.Color]::Transparent
+$gbGen.Controls.Add($chkAutoStep)
+
+# F1: Channel overrides JSON editor
+$gbGen.Controls.Add((New-Lbl "Channel Overrides (JSON):" 8 346 200 18))
+$gbGen.Controls.Add((New-Lbl "[{ universe:0, channel:1, value:255 }, ...]" 215 348 460 16))
+$txtChOverrides = New-Object System.Windows.Forms.TextBox
+$txtChOverrides.Location   = [System.Drawing.Point]::new(8, 368)
+$txtChOverrides.Size       = [System.Drawing.Size]::new(666, 80)
+$txtChOverrides.Multiline  = $true
+$txtChOverrides.ScrollBars = "Vertical"
+$txtChOverrides.BackColor  = $DarkInput
+$txtChOverrides.ForeColor  = $TxtWhite
+$txtChOverrides.Font       = New-Object System.Drawing.Font("Consolas", 9)
+$txtChOverrides.Text       = "[]"
+$gbGen.Controls.Add($txtChOverrides)
+
 # ===========================================================================
 # 4. EMAIL ALERTS  (y=880, h=118)
 # ===========================================================================
-$gbEmail = New-GB "Email Alerts (Gmail)" 8 880 684 118
+$gbEmail = New-GB "Email Alerts (Gmail)" 8 1020 684 118
 $form.Controls.Add($gbEmail)
 
 $chkEmailEn = New-Object System.Windows.Forms.CheckBox
@@ -519,7 +590,7 @@ $gbEmail.Controls.Add($lblEmailMsg)
 # ===========================================================================
 # 5. PUSH NOTIFICATIONS & AUDIO  (y=1008, h=120)
 # ===========================================================================
-$gbPush = New-GB "Push Notifications & Audio" 8 1008 684 120
+$gbPush = New-GB "Push Notifications & Audio" 8 1148 684 120
 $form.Controls.Add($gbPush)
 
 $chkNtfyEn = New-Object System.Windows.Forms.CheckBox
@@ -559,9 +630,9 @@ $lblNtfyMsg.ForeColor = [System.Drawing.Color]::FromArgb(100,200,100)
 $gbPush.Controls.Add($lblNtfyMsg)
 
 # ===========================================================================
-# 6. ALERTS LOG  (y=1138, h=230)
+# 6. ALERTS LOG  (y=1278, h=230)
 # ===========================================================================
-$gbLog = New-GB "Alerts Log" 8 1138 684 230
+$gbLog = New-GB "Alerts Log" 8 1278 684 230
 $form.Controls.Add($gbLog)
 
 $rtbLog = New-Object System.Windows.Forms.RichTextBox
@@ -628,8 +699,13 @@ function Refresh-Log {
         }
         return
     }
-    try { $allLines = @(Get-Content $AlertsLog -ErrorAction Stop) }
-    catch { return }   # file momentarily locked
+    try {
+        $fs     = [System.IO.File]::Open($AlertsLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+        $raw    = $reader.ReadToEnd()
+        $reader.Close(); $fs.Dispose()
+        $allLines = @($raw -split "`r?`n" | Where-Object { $_ -ne '' })
+    } catch { return }   # file momentarily locked
 
     # Only process lines we haven't shown yet
     $newLines = if ($allLines.Count -gt $script:logLineOffset) {
@@ -817,6 +893,12 @@ function Apply-ConfigToUI {
         if ($null -ne $a.audio_enabled) { $chkAudioEn.Checked  = [bool]$a.audio_enabled }
         if ($a.audio_file)              { $txtAudioFile.Text   = $a.audio_file }
     }
+    # F1: populate channel overrides JSON editor
+    if ($g -and $g.channel_overrides) {
+        try {
+            $txtChOverrides.Text = ($g.channel_overrides | ConvertTo-Json -Compress)
+        } catch { $txtChOverrides.Text = "[]" }
+    }
     Load-IPHistory
 }
 
@@ -985,7 +1067,8 @@ $btnSaveCfg.Add_Click({
                 -AudioFile $txtAudioFile.Text.Trim() `
                 -GenDestIP $txtDstIP.Text.Trim() -GenSrcIP $txtSrcIP.Text.Trim() `
                 -GenCount ([int]$numGenCount.Value) -GenStart ([int]$numGenStart.Value) `
-                -GenPPS ([int]$numGenPPS.Value) -GenEnabled $enabledUnis
+                -GenPPS ([int]$numGenPPS.Value) -GenEnabled $enabledUnis `
+                -ChannelOverridesJson $txtChOverrides.Text.Trim()
     $lblCfgMsg.Text = "Saved at $(Get-Date -Format 'HH:mm:ss')"
     $stripLbl.Text  = "Config saved to $ConfigPath"
     Update-IPHistory -SrcIP $txtSrcIP.Text.Trim() -DstIP $txtDstIP.Text.Trim() `
@@ -1049,6 +1132,13 @@ $btnAllOff.Add_Click({
     if ($script:generatorProc -and -not $script:generatorProc.HasExited) { Write-GenControl }
 })
 
+$btnBrowseScene.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = "JSON Scene Files (*.json)|*.json|All Files (*.*)|*.*"
+    $dlg.Title  = "Select Scene File"
+    if ($dlg.ShowDialog() -eq 'OK') { $txtSceneFile.Text = $dlg.FileName }
+})
+
 $btnStartGen.Add_Click({
     $srcIP = $txtSrcIP.Text.Trim()
     $dstIP = $txtDstIP.Text.Trim()
@@ -1094,6 +1184,17 @@ $btnStartGen.Add_Click({
         $genArgs = "$genArgs -EnabledUniverses $enabledStr"
     }
     if ($srcIP -ne "") { $genArgs = "-SourceIP $srcIP $genArgs" }
+
+    # F3: Burst mode
+    if ($chkBurst.Checked) {
+        $genArgs = "$genArgs -Burst -BurstHz $([int]$numBurstHz.Value) -BurstDurationSeconds $([int]$numBurstDur.Value)"
+    }
+    # F2: Scene file
+    $sceneFilePath = $txtSceneFile.Text.Trim()
+    if ($sceneFilePath -and (Test-Path $sceneFilePath)) {
+        $genArgs = "$genArgs -SceneFile `"$sceneFilePath`""
+        if ($chkAutoStep.Checked) { $genArgs = "$genArgs -AutoStep" }
+    }
 
     $psArgs = "-NoProfile -ExecutionPolicy Bypass -NoExit " +
               "-File `"$ScriptsPath\artnet-generator.ps1`" $genArgs"
@@ -1211,7 +1312,13 @@ $btnRefLog.Add_Click({
 $btnClearLog.Add_Click({
     # Advance offset to current file length so auto-refresh won't reload old entries
     if (Test-Path $AlertsLog) {
-        try { $script:logLineOffset = @(Get-Content $AlertsLog -ErrorAction Stop).Count } catch {}
+        try {
+            $fs2 = [System.IO.File]::Open($AlertsLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $rd2 = New-Object System.IO.StreamReader($fs2, [System.Text.Encoding]::UTF8)
+            $cnt = ($rd2.ReadToEnd() -split "`r?`n" | Where-Object { $_ -ne '' }).Count
+            $rd2.Close(); $fs2.Dispose()
+            $script:logLineOffset = $cnt
+        } catch {}
     }
     $rtbLog.Clear()
 })
@@ -1289,7 +1396,13 @@ $form.Add_Load({
     Refresh-HealthGrid
     # Start offset at end of existing log so old entries are not shown on launch
     if (Test-Path $AlertsLog) {
-        try { $script:logLineOffset = @(Get-Content $AlertsLog -ErrorAction Stop).Count } catch {}
+        try {
+            $fs2 = [System.IO.File]::Open($AlertsLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $rd2 = New-Object System.IO.StreamReader($fs2, [System.Text.Encoding]::UTF8)
+            $cnt = ($rd2.ReadToEnd() -split "`r?`n" | Where-Object { $_ -ne '' }).Count
+            $rd2.Close(); $fs2.Dispose()
+            $script:logLineOffset = $cnt
+        } catch {}
     }
     $timerLog.Start()
     $timerStatus.Start()
