@@ -1,5 +1,5 @@
 # artnet-monitor-gui.ps1
-# Art-Net Monitor Control Panel — Windows GUI (PowerShell / WinForms)
+# Art-Net Monitor Control Panel - Windows GUI (PowerShell / WinForms)
 #
 # Run on RADIO PC (as Administrator for tshark capture to work).
 #
@@ -10,7 +10,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-# Hide the PowerShell console window — works regardless of how the script is launched
+# Hide the PowerShell console window - works regardless of how the script is launched
 Add-Type -Name ConsoleHide -Namespace Win32 -MemberDefinition @'
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -55,14 +55,18 @@ function Save-Config {
         # Email params
         [bool]$EmailEnabled, [string]$SmtpServer, [int]$SmtpPort, [bool]$UseSSL,
         [string]$FromAddr, [string]$AppPass, [string]$ToAddr,
+        # Push/audio params
+        [bool]$NtfyEnabled, [string]$NtfyTopic, [string]$NtfyServer,
+        [bool]$AudioEnabled, [string]$AudioFile,
         # Generator params
         [string]$GenDestIP, [string]$GenSrcIP,
         [int]$GenCount, [int]$GenStart, [int]$GenPPS, [int[]]$GenEnabled
     )
-    # Preserve existing email/generator values if not supplied (so partial saves don't wipe them)
+    # Preserve existing email/generator/alerts values if not supplied
     Load-Config
-    $existingEmail = if ($script:cfg -and $script:cfg.email) { $script:cfg.email } else { $null }
-    $existingGen   = if ($script:cfg -and $script:cfg.generator) { $script:cfg.generator } else { $null }
+    $existingEmail  = if ($script:cfg -and $script:cfg.email)   { $script:cfg.email }   else { $null }
+    $existingGen    = if ($script:cfg -and $script:cfg.generator){ $script:cfg.generator } else { $null }
+    $existingAlerts = if ($script:cfg -and $script:cfg.alerts)  { $script:cfg.alerts }  else { $null }
 
     $emailObj = [ordered]@{
         enabled      = $EmailEnabled
@@ -73,6 +77,13 @@ function Save-Config {
         app_password = if ($AppPass) { $AppPass } elseif ($existingEmail) { $existingEmail.app_password } else { '' }
         to_address   = if ($ToAddr) { $ToAddr } elseif ($existingEmail) { $existingEmail.to_address } else { '' }
         alert_types  = @('ALERT','RECOVERY')
+    }
+    $alertsObj = [ordered]@{
+        ntfy_enabled  = $NtfyEnabled
+        ntfy_topic    = if ($PSBoundParameters.ContainsKey('NtfyTopic'))  { $NtfyTopic }  elseif ($existingAlerts) { $existingAlerts.ntfy_topic }  else { '' }
+        ntfy_server   = if ($PSBoundParameters.ContainsKey('NtfyServer')) { $NtfyServer } elseif ($existingAlerts) { $existingAlerts.ntfy_server } else { 'https://ntfy.sh' }
+        audio_enabled = $AudioEnabled
+        audio_file    = if ($PSBoundParameters.ContainsKey('AudioFile'))  { $AudioFile }  elseif ($existingAlerts) { $existingAlerts.audio_file }  else { '' }
     }
     $genObj = [ordered]@{
         destination_ip    = if ($GenDestIP) { $GenDestIP } elseif ($existingGen) { $existingGen.destination_ip } else { '255.255.255.255' }
@@ -95,6 +106,7 @@ function Save-Config {
         }
         email     = $emailObj
         generator = $genObj
+        alerts    = $alertsObj
         paths = [ordered]@{
             tshark     = $TsharkPath
             captures   = 'C:\AV-Monitoring\captures'
@@ -229,7 +241,7 @@ function New-GB {
 # ===========================================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = "Art-Net Monitor - Control Panel"
-$form.ClientSize      = [System.Drawing.Size]::new(700, 1270)
+$form.ClientSize      = [System.Drawing.Size]::new(700, 1400)
 $form.FormBorderStyle = "Sizable"
 $form.MaximizeBox     = $true
 $form.StartPosition   = "CenterScreen"
@@ -294,7 +306,7 @@ $gbCfg.Controls.Add((New-Lbl "to" 177 152 20))
 $txtSuppressTo = New-Txt 199 149 60 ""
 $txtSuppressTo.MaxLength = 5
 $gbCfg.Controls.Add($txtSuppressTo)
-$lblSuppHint = New-Lbl "(24h HH:mm — blank=disabled; emails only, still logs to file)" 265 152 400 20
+$lblSuppHint = New-Lbl "(24h HH:mm - blank=disabled; emails only, still logs to file)" 265 152 400 20
 $lblSuppHint.ForeColor = [System.Drawing.Color]::FromArgb(85,85,85)
 $gbCfg.Controls.Add($lblSuppHint)
 
@@ -407,7 +419,7 @@ function Write-GenControl {
 }
 
 function Build-UniverseGrid {
-    # Dispose old checkboxes before clearing — Controls.Clear() does not dispose them
+    # Dispose old checkboxes before clearing - Controls.Clear() does not dispose them
     foreach ($cb in $script:uniCheckboxes) { try { $cb.Dispose() } catch {} }
     $pnlUni.Controls.Clear()
     $script:uniCheckboxes.Clear()
@@ -491,9 +503,51 @@ $lblEmailMsg.ForeColor = [System.Drawing.Color]::FromArgb(100,200,100)
 $gbEmail.Controls.Add($lblEmailMsg)
 
 # ===========================================================================
-# 5. ALERTS LOG  (y=1008, h=230)
+# 5. PUSH NOTIFICATIONS & AUDIO  (y=1008, h=120)
 # ===========================================================================
-$gbLog = New-GB "Alerts Log" 8 1008 684 230
+$gbPush = New-GB "Push Notifications & Audio" 8 1008 684 120
+$form.Controls.Add($gbPush)
+
+$chkNtfyEn = New-Object System.Windows.Forms.CheckBox
+$chkNtfyEn.Text      = "Enable ntfy.sh push"
+$chkNtfyEn.Location  = [System.Drawing.Point]::new(10, 22)
+$chkNtfyEn.Size      = [System.Drawing.Size]::new(150, 22)
+$chkNtfyEn.ForeColor = $TxtWhite
+$chkNtfyEn.BackColor = [System.Drawing.Color]::Transparent
+$gbPush.Controls.Add($chkNtfyEn)
+
+$gbPush.Controls.Add((New-Lbl "Topic:" 168 24 44))
+$txtNtfyTopic = New-Txt 215 21 160 ""
+$gbPush.Controls.Add($txtNtfyTopic)
+
+$gbPush.Controls.Add((New-Lbl "Server:" 385 24 48))
+$txtNtfyServer = New-Txt 436 21 240 "https://ntfy.sh"
+$gbPush.Controls.Add($txtNtfyServer)
+
+$chkAudioEn = New-Object System.Windows.Forms.CheckBox
+$chkAudioEn.Text      = "Enable audio alarm"
+$chkAudioEn.Location  = [System.Drawing.Point]::new(10, 52)
+$chkAudioEn.Size      = [System.Drawing.Size]::new(150, 22)
+$chkAudioEn.ForeColor = $TxtWhite
+$chkAudioEn.BackColor = [System.Drawing.Color]::Transparent
+$gbPush.Controls.Add($chkAudioEn)
+
+$gbPush.Controls.Add((New-Lbl "WAV file:" 168 54 62))
+$txtAudioFile = New-Txt 233 51 290 ""
+$txtAudioFile.PlaceholderText = "(blank = use system beep)"
+$gbPush.Controls.Add($txtAudioFile)
+
+$btnTestNtfy = New-Btn "Test Notification" 10 82 140 28 $BtnGray
+$gbPush.Controls.Add($btnTestNtfy)
+
+$lblNtfyMsg = New-Lbl "" 160 86 520 20
+$lblNtfyMsg.ForeColor = [System.Drawing.Color]::FromArgb(100,200,100)
+$gbPush.Controls.Add($lblNtfyMsg)
+
+# ===========================================================================
+# 6. ALERTS LOG  (y=1138, h=230)
+# ===========================================================================
+$gbLog = New-GB "Alerts Log" 8 1138 684 230
 $form.Controls.Add($gbLog)
 
 $rtbLog = New-Object System.Windows.Forms.RichTextBox
@@ -597,7 +651,7 @@ function Write-AlertLog {
 }
 
 # ---------------------------------------------------------------------------
-# Health grid — build tiles from expected universe list, refresh from JSON
+# Health grid - build tiles from expected universe list, refresh from JSON
 # ---------------------------------------------------------------------------
 function Build-HealthGrid {
     foreach ($lbl in $script:healthTiles.Values) { try { $lbl.Dispose() } catch {} }
@@ -631,7 +685,13 @@ function Build-HealthGrid {
 function Refresh-HealthGrid {
     if (-not (Test-Path $StatusJsonPath)) { return }
     $status = $null
-    try { $status = Get-Content $StatusJsonPath -Raw | ConvertFrom-Json } catch { return }
+    try {
+        $fs     = [System.IO.File]::Open($StatusJsonPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+        $raw    = $reader.ReadToEnd()
+        $reader.Close(); $fs.Dispose()
+        $status = $raw | ConvertFrom-Json
+    } catch { return }
     if (-not $status -or -not $status.universes) { return }
     foreach ($kv in $script:healthTiles.GetEnumerator()) {
         $uni  = $kv.Key
@@ -660,11 +720,6 @@ function Refresh-HealthGrid {
         }
         $lbl.Text = "U$uni`n$stateShort`n${hz} Hz"
     }
-}
-
-function Update-Status {
-    } catch {}
-    Refresh-Log
 }
 
 function Update-Status {
@@ -724,6 +779,7 @@ function Apply-ConfigToUI {
     $m = $script:cfg.monitoring
     $g = $script:cfg.generator
     $e = $script:cfg.email
+    $a = $script:cfg.alerts
     if ($m.expected_universes)            { $txtUnis.Text = ($m.expected_universes -join ", ") }
     if ($m.timeout_seconds)               { $numTimeout.Value = [Math]::Max(1,[Math]::Min(120,[int]$m.timeout_seconds)) }
     if ($null -ne $m.startup_grace_seconds) { $numGrace.Value = [Math]::Max(0,[Math]::Min(120,[int]$m.startup_grace_seconds)) }
@@ -739,6 +795,13 @@ function Apply-ConfigToUI {
         if ($null -ne $e.enabled) { $chkEmailEn.Checked = [bool]$e.enabled }
         if ($e.app_password -and $e.app_password -notmatch '^xxxx') { $txtEmailPass.Text = $e.app_password }
         # Don't set email_from / email_to from config - history handles recall
+    }
+    if ($a) {
+        if ($null -ne $a.ntfy_enabled)  { $chkNtfyEn.Checked  = [bool]$a.ntfy_enabled }
+        if ($a.ntfy_topic)              { $txtNtfyTopic.Text   = $a.ntfy_topic }
+        if ($a.ntfy_server)             { $txtNtfyServer.Text  = $a.ntfy_server }
+        if ($null -ne $a.audio_enabled) { $chkAudioEn.Checked  = [bool]$a.audio_enabled }
+        if ($a.audio_file)              { $txtAudioFile.Text   = $a.audio_file }
     }
     Load-IPHistory
 }
@@ -901,6 +964,11 @@ $btnSaveCfg.Add_Click({
                 -FromAddr $txtEmailFrom.Text.Trim() `
                 -AppPass $txtEmailPass.Text.Trim() `
                 -ToAddr $txtEmailTo.Text.Trim() `
+                -NtfyEnabled $chkNtfyEn.Checked `
+                -NtfyTopic $txtNtfyTopic.Text.Trim() `
+                -NtfyServer $txtNtfyServer.Text.Trim() `
+                -AudioEnabled $chkAudioEn.Checked `
+                -AudioFile $txtAudioFile.Text.Trim() `
                 -GenDestIP $txtDstIP.Text.Trim() -GenSrcIP $txtSrcIP.Text.Trim() `
                 -GenCount ([int]$numGenCount.Value) -GenStart ([int]$numGenStart.Value) `
                 -GenPPS ([int]$numGenPPS.Value) -GenEnabled $enabledUnis
@@ -1086,6 +1154,38 @@ $btnTestEmail.Add_Click({
     } finally {
         if ($msg)  { try { $msg.Dispose()  } catch {} }
         if ($smtp) { try { $smtp.Dispose() } catch {} }
+    }
+})
+
+$btnTestNtfy.Add_Click({
+    $topic  = $txtNtfyTopic.Text.Trim()
+    $server = $txtNtfyServer.Text.Trim()
+    if (-not $server) { $server = "https://ntfy.sh" }
+    if (-not $topic) {
+        [System.Windows.Forms.MessageBox]::Show("Enter a Topic before testing.", "ntfy Test", "OK", "Warning") | Out-Null
+        return
+    }
+    $lblNtfyMsg.Text = "Sending..."
+    $form.Refresh()
+    $wc = $null
+    try {
+        $url  = "$server/$topic"
+        $body = "Test notification from Art-Net Monitor on $(hostname) at $(Get-Date)"
+        $wc   = New-Object System.Net.WebClient
+        $wc.Headers.Add("Title", "Art-Net Monitor Test")
+        $wc.Headers.Add("Priority", "default")
+        $wc.Headers.Add("Tags", "test,artnet")
+        $wc.UploadString($url, $body) | Out-Null
+        $lblNtfyMsg.Text = "Sent OK at $(Get-Date -Format 'HH:mm:ss')"
+        $lblNtfyMsg.ForeColor = [System.Drawing.Color]::FromArgb(100,200,100)
+        Write-AlertLog -Type "INFO" -Message "Test ntfy notification sent OK: $url"
+    } catch {
+        $errMsg = $_.Exception.Message
+        $lblNtfyMsg.Text = "FAILED: $errMsg"
+        $lblNtfyMsg.ForeColor = [System.Drawing.Color]::FromArgb(255,80,80)
+        Write-AlertLog -Type "WARN" -Message "Test ntfy notification FAILED: $errMsg (url=$server/$topic)"
+    } finally {
+        if ($wc) { try { $wc.Dispose() } catch {} }
     }
 })
 
